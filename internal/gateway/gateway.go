@@ -57,6 +57,8 @@ type Gateway struct {
 	log      *slog.Logger
 	now      func() time.Time // overridable in tests
 
+	engineLocal bool // engine never does I/O: skip the per-call deadline
+
 	shapeWaiters    atomic.Int64
 	maxShapeWaiters int64
 
@@ -82,14 +84,70 @@ func New(o Options) *Gateway {
 	if g.engine == nil {
 		g.engine = noEngine{}
 	}
+	if l, ok := g.engine.(inProcessEngine); ok {
+		g.engineLocal = l.InProcess()
+	}
 	if g.log == nil {
 		g.log = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
-	t := http.DefaultTransport.(*http.Transport).Clone()
-	t.MaxIdleConnsPerHost = 64
-	t.MaxIdleConns = 512
-	g.transport = t
+	g.transport = newTransport()
 	return g
+}
+
+// newTransport is the upstream transport shared by every route. Keep-alive
+// pools are sized so a busy upstream does not churn connections (each
+// extra dial costs a loopback/LAN round trip plus TIME_WAIT state); HTTP/2
+// is negotiated for TLS upstreams.
+func newTransport() *http.Transport {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.MaxIdleConns = 2048
+	t.MaxIdleConnsPerHost = 512
+	t.IdleConnTimeout = 90 * time.Second
+	t.ForceAttemptHTTP2 = true
+	return t
+}
+
+// bufferPool recycles the 32KB copy buffers ReverseProxy would otherwise
+// allocate for every proxied response body (the dominant allocation on the
+// proxy path). httputil.BufferPool hands buffers over as []byte, so the
+// pool stores *[proxyBufSize]byte (a single pointer: no extra allocation
+// per Put) and converts back with a slice expression.
+type bufferPool struct{ p sync.Pool }
+
+const proxyBufSize = 32 << 10
+
+func (b *bufferPool) Get() []byte {
+	if v, ok := b.p.Get().(*[proxyBufSize]byte); ok {
+		return v[:]
+	}
+	return new([proxyBufSize]byte)[:]
+}
+
+func (b *bufferPool) Put(buf []byte) {
+	if cap(buf) != proxyBufSize {
+		return
+	}
+	b.p.Put((*[proxyBufSize]byte)(buf[:proxyBufSize]))
+}
+
+var proxyBuffers = &bufferPool{}
+
+// inProcessEngine is implemented by engines that never block on I/O (the
+// memory engine), for which a per-request deadline is pure overhead (a
+// timer and a context allocation per request).
+type inProcessEngine interface{ InProcess() bool }
+
+const engineTimeout = 5 * time.Second
+
+func nopCancel() {}
+
+// engineCtx bounds an engine call: 5s for networked engines; in-process
+// engines get the request context unchanged.
+func (g *Gateway) engineCtx(ctx context.Context) (context.Context, context.CancelFunc) {
+	if g.engineLocal {
+		return ctx, nopCancel
+	}
+	return context.WithTimeout(ctx, engineTimeout)
 }
 
 // noEngine is used when Options.Engine is nil.
@@ -143,6 +201,7 @@ func (g *Gateway) proxyFor(key string, target *url.URL) *httputil.ReverseProxy {
 		FlushInterval:  -1, // stream (SSE, chunked) responses straight through
 		ModifyResponse: modifyResponse,
 		ErrorHandler:   proxyError,
+		BufferPool:     proxyBuffers,
 		ErrorLog:       slog.NewLogLogger(g.log.Handler(), slog.LevelDebug),
 	}
 	g.proxies[key] = p
@@ -200,7 +259,7 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // The result is what is matched, keyed on and forwarded.
 func cleanPath(u *url.URL) (string, bool) {
 	esc := u.EscapedPath()
-	if strings.Contains(strings.ToLower(esc), "%2f") || strings.Contains(esc, "\\") ||
+	if strings.Contains(esc, "%2f") || strings.Contains(esc, "%2F") || strings.Contains(esc, "\\") ||
 		strings.ContainsRune(u.Path, 0) || strings.Contains(esc, "%00") || strings.Contains(u.Path, "\\") {
 		return "", false
 	}
@@ -209,7 +268,10 @@ func cleanPath(u *url.URL) (string, bool) {
 		return "/", true
 	}
 	trailing := strings.HasSuffix(p, "/")
-	p = pathpkg.Clean("/" + p)
+	if p[0] != '/' {
+		p = "/" + p
+	}
+	p = pathpkg.Clean(p) // allocation-free when p is already clean
 	if trailing && p != "/" {
 		p += "/"
 	}
@@ -360,7 +422,7 @@ func (g *Gateway) serveProxy(w http.ResponseWriter, r *http.Request, cleaned str
 		return q.Get(name)
 	}
 	ri.apiKey = cfg.extractKey(r.Header.Get)
-	cons, reason := cfg.authenticate(ri.apiKey, start)
+	cons, reason := ri.authenticate(cfg, start)
 	if reason != "" || (cons == nil && route.r.RequireAPIKey) {
 		msg := "A valid API key is required"
 		if reason != "" {
@@ -400,7 +462,7 @@ func (g *Gateway) serveProxy(w http.ResponseWriter, r *http.Request, cleaned str
 		reserved = true
 	}
 
-	ectx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	ectx, cancel := g.engineCtx(r.Context())
 	out = g.evaluate(ectx, ri, evalOpts{costMul: 1})
 	cancel()
 	for _, s := range out.soft {
@@ -468,9 +530,7 @@ func (g *Gateway) serveProxy(w http.ResponseWriter, r *http.Request, cleaned str
 	st = &reqState{consumerID: le.ConsumerID, clientIP: ip, started: g.now()}
 	st.xff, st.proto, st.host = forwardedFor(cfg, r, xff)
 	if b := out.best; b != nil {
-		for k, v := range rateHeaders(cfg, b, start, false) {
-			w.Header().Set(k, v)
-		}
+		setRateHeaders(w.Header(), cfg, b, start, false)
 		st.rlHeaders = true
 		if cfg.exposeDecision {
 			w.Header().Set("X-RateGuard-Policy", b.cp.p.ID)
@@ -546,16 +606,40 @@ func (g *Gateway) writeLimited(w http.ResponseWriter, cfg *compiled, d *polResul
 // writeLimitedAs is writeLimited with a caller-chosen status (forward auth's
 // deny_status); headers and body are identical.
 func (g *Gateway) writeLimitedAs(w http.ResponseWriter, status int, cfg *compiled, d *polResult, start time.Time) {
-	for k, v := range rateHeaders(cfg, d, start, true) {
-		w.Header().Set(k, v)
-	}
+	setRateHeaders(w.Header(), cfg, d, start, true)
 	if cfg.exposeDecision {
 		w.Header().Set("X-RateGuard-Policy", d.cp.p.ID)
 	}
-	writeJSON(w, status, map[string]any{
-		"error": "rate_limited", "message": "Rate limit exceeded", "policy": d.cp.p.Name,
-		"limit": limitOf(d), "remaining": 0, "retry_after_s": retryAfterSeconds(d.dec), "reset_s": ceilSeconds(d.dec.ResetAfter),
-	})
+	b := limitedBody(d)
+	h := w.Header()
+	h["Content-Type"] = jsonContentType
+	h["Content-Length"] = []string{strconv.Itoa(len(b))}
+	w.WriteHeader(status)
+	w.Write(b)
+}
+
+var jsonContentType = []string{"application/json"}
+
+// limitedBody renders the 429 JSON body byte-for-byte as
+// writeJSON(map[string]any{...}) would (sorted keys, trailing newline),
+// without reflection; the policy name is JSON-encoded once at compile time.
+func limitedBody(d *polResult) []byte {
+	name := d.cp.nameJSON
+	if name == "" { // cpolicy built outside compile (tests)
+		nb, _ := json.Marshal(d.cp.p.Name)
+		name = string(nb)
+	}
+	b := make([]byte, 0, 128+len(name))
+	b = append(b, `{"error":"rate_limited","limit":`...)
+	b = strconv.AppendInt(b, int64(limitOf(d)), 10)
+	b = append(b, `,"message":"Rate limit exceeded","policy":`...)
+	b = append(b, name...)
+	b = append(b, `,"remaining":0,"reset_s":`...)
+	b = strconv.AppendInt(b, int64(ceilSeconds(d.dec.ResetAfter)), 10)
+	b = append(b, `,"retry_after_s":`...)
+	b = strconv.AppendInt(b, int64(retryAfterSeconds(d.dec)), 10)
+	b = append(b, "}\n"...)
+	return b
 }
 
 func limitOf(r *polResult) int {
@@ -589,11 +673,7 @@ func rateHeaders(cfg *compiled, r *polResult, now time.Time, limited bool) map[s
 		"RateLimit-Reset":     strconv.Itoa(reset),
 	}
 	if !r.cp.conc {
-		w := ceilSeconds(r.params.Window)
-		if w < 1 {
-			w = 1
-		}
-		h["RateLimit-Policy"] = strconv.Itoa(r.params.Limit) + ";w=" + strconv.Itoa(w)
+		h["RateLimit-Policy"] = policyHeader(r.params)
 	}
 	if cfg.legacyHeaders {
 		h["X-RateLimit-Limit"] = h["RateLimit-Limit"]
@@ -604,6 +684,53 @@ func rateHeaders(cfg *compiled, r *polResult, now time.Time, limited bool) map[s
 		h["Retry-After"] = strconv.Itoa(retryAfterSeconds(r.dec))
 	}
 	return h
+}
+
+// setRateHeaders writes exactly the headers rateHeaders describes into h
+// (same names after canonicalisation, same values, replacing any existing
+// value like Header.Set) without building an intermediate map: the
+// canonical names are constants, all values share one backing array, and
+// the RateLimit-Policy value is precomputed per policy at compile time when
+// no plan/consumer override changed the numbers.
+func setRateHeaders(h http.Header, cfg *compiled, r *polResult, now time.Time, limited bool) {
+	n := 5
+	if cfg.legacyHeaders {
+		n = 8
+	}
+	vals := make([]string, n)
+	put := func(i int, k, v string) {
+		vals[i] = v
+		h[k] = vals[i : i+1 : i+1]
+	}
+	reset := ceilSeconds(r.dec.ResetAfter)
+	lim, rem := strconv.Itoa(limitOf(r)), strconv.Itoa(r.dec.Remaining)
+	put(0, "Ratelimit-Limit", lim)
+	put(1, "Ratelimit-Remaining", rem)
+	put(2, "Ratelimit-Reset", strconv.Itoa(reset))
+	if !r.cp.conc {
+		pv := r.cp.policyHdr
+		if r.params.Limit != r.cp.p.Limit || r.params.Window != r.cp.p.Window.D() {
+			pv = policyHeader(r.params)
+		}
+		put(3, "Ratelimit-Policy", pv)
+	}
+	if limited {
+		put(4, "Retry-After", strconv.Itoa(retryAfterSeconds(r.dec)))
+	}
+	if cfg.legacyHeaders {
+		put(5, "X-Ratelimit-Limit", lim)
+		put(6, "X-Ratelimit-Remaining", rem)
+		put(7, "X-Ratelimit-Reset", strconv.FormatInt(now.Add(time.Duration(reset)*time.Second).Unix(), 10))
+	}
+}
+
+// policyHeader is the RateLimit-Policy value ("<limit>;w=<window seconds>").
+func policyHeader(p ratelimit.Params) string {
+	w := ceilSeconds(p.Window)
+	if w < 1 {
+		w = 1
+	}
+	return strconv.Itoa(p.Limit) + ";w=" + strconv.Itoa(w)
 }
 
 // ---------------------------------------------------------------------
@@ -665,6 +792,9 @@ func rewriteRequest(target *url.URL) func(*httputil.ProxyRequest) {
 	}
 }
 
+var ownRateHeaders = []string{"Ratelimit-Limit", "Ratelimit-Remaining", "Ratelimit-Reset", "Ratelimit-Policy",
+	"X-Ratelimit-Limit", "X-Ratelimit-Remaining", "X-Ratelimit-Reset", "Retry-After"}
+
 func modifyResponse(resp *http.Response) error {
 	st, _ := resp.Request.Context().Value(ctxKey{}).(*reqState)
 	if st == nil {
@@ -679,8 +809,7 @@ func modifyResponse(resp *http.Response) error {
 		}
 	}
 	if st.rlHeaders {
-		for _, k := range []string{"Ratelimit-Limit", "Ratelimit-Remaining", "Ratelimit-Reset", "Ratelimit-Policy",
-			"X-Ratelimit-Limit", "X-Ratelimit-Remaining", "X-Ratelimit-Reset", "Retry-After"} {
+		for _, k := range ownRateHeaders {
 			if k == "Retry-After" && resp.StatusCode != http.StatusTooManyRequests {
 				continue
 			}
@@ -706,6 +835,26 @@ func proxyError(w http.ResponseWriter, r *http.Request, err error) {
 // isRGHeader reports whether a header name is in the reserved X-RateGuard-*
 // namespace, treating "_" as "-" so CGI/WSGI-style aliases
 // (X-Rateguard_Consumer) cannot slip through.
+//
+// It runs for every header in both directions, so it compares in place
+// instead of building a lower-cased copy. Only ASCII is folded: no
+// non-ASCII rune lower-cases to a character of the prefix, so this is
+// equivalent to strings.ToLower + ReplaceAll.
 func isRGHeader(k string) bool {
-	return strings.HasPrefix(strings.ReplaceAll(strings.ToLower(k), "_", "-"), "x-rateguard-")
+	const prefix = "x-rateguard-"
+	if len(k) < len(prefix) {
+		return false
+	}
+	for i := 0; i < len(prefix); i++ {
+		c := k[i]
+		if 'A' <= c && c <= 'Z' {
+			c += 'a' - 'A'
+		} else if c == '_' {
+			c = '-'
+		}
+		if c != prefix[i] {
+			return false
+		}
+	}
+	return true
 }

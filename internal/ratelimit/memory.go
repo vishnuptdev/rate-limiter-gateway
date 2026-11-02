@@ -2,7 +2,7 @@ package ratelimit
 
 import (
 	"context"
-	"hash/fnv"
+	"hash/maphash"
 	"log/slog"
 	"math"
 	"sync"
@@ -33,7 +33,8 @@ type MemoryOptions struct {
 }
 
 // Memory is an in-process Engine. State is spread over 64 mutex-protected
-// shards chosen by FNV-1a of the key, so unrelated keys rarely contend.
+// shards chosen by a seeded hash/maphash of the key, so unrelated keys
+// rarely contend; the hot path (an existing key) does not allocate.
 //
 // Bounded memory: at most MaxKeys keys are tracked. When full, a new key
 // first evicts a fully replenished (idle) entry from its shard, sampling up
@@ -49,6 +50,7 @@ type MemoryOptions struct {
 // the trailing window, so its memory is O(Limit) per key by definition.
 type Memory struct {
 	shards  [numShards]shard
+	seed    maphash.Seed
 	now     func() time.Time
 	maxKeys int64
 	keys    atomic.Int64
@@ -73,7 +75,14 @@ type overflowSlot struct {
 
 type shard struct {
 	mu sync.Mutex
-	m  map[string]*entry
+	m  map[skey]*entry
+}
+
+// skey identifies one (algorithm, key) state. A struct key (rather than a
+// concatenated string) makes lookups allocation-free.
+type skey struct {
+	algo model.Algorithm
+	key  string
 }
 
 type logRec struct {
@@ -95,7 +104,8 @@ type entry struct {
 	tat int64
 
 	// sliding window log
-	log []logRec
+	log    []logRec
+	logSum int // total units in log
 
 	// sliding window counter / fixed window
 	winIdx int64
@@ -113,6 +123,7 @@ func NewMemory(opts MemoryOptions) *Memory {
 		now:     opts.Now,
 		maxKeys: int64(opts.MaxKeys),
 		log:     opts.Logger,
+		seed:    maphash.MakeSeed(),
 		stop:    make(chan struct{}),
 		done:    make(chan struct{}),
 	}
@@ -126,7 +137,7 @@ func NewMemory(opts MemoryOptions) *Memory {
 		m.log = slog.Default()
 	}
 	for i := range m.shards {
-		m.shards[i].m = make(map[string]*entry)
+		m.shards[i].m = make(map[skey]*entry)
 	}
 	gc := opts.GCInterval
 	if gc <= 0 {
@@ -136,7 +147,11 @@ func NewMemory(opts MemoryOptions) *Memory {
 	return m
 }
 
-func (m *Memory) Name() string                      { return "memory" }
+func (m *Memory) Name() string { return "memory" }
+
+// InProcess reports that the engine never blocks on I/O, so callers need
+// not put a deadline on its calls (the context is not consulted).
+func (m *Memory) InProcess() bool                   { return true }
 func (m *Memory) Healthy(ctx context.Context) error { return nil }
 
 // Close stops the GC goroutine. It is safe to call more than once.
@@ -213,13 +228,13 @@ func (e *entry) purgeLeases(now int64) {
 	}
 }
 
-func (m *Memory) overflowSlotFor(sk string) *overflowSlot {
-	h := fnv.New32a()
-	h.Write([]byte(sk))
-	return &m.overflow[h.Sum32()%overflowBuckets]
+// overflowSlotFor uses the high half of the key hash (the shard uses the
+// low bits), so overflow buckets are spread independently of shards.
+func (m *Memory) overflowSlotFor(sk skey) *overflowSlot {
+	return &m.overflow[(maphash.String(m.seed, sk.key)>>32)%overflowBuckets]
 }
 
-func (m *Memory) allowOverflow(sk string, p Params, now int64) Decision {
+func (m *Memory) allowOverflow(sk skey, p Params, now int64) Decision {
 	m.overflowN.Add(1)
 	m.overflowLast.Store(now)
 	if last := m.warnLast.Load(); now-last >= int64(overflowWarnEvery) && m.warnLast.CompareAndSwap(last, now) {
@@ -255,13 +270,11 @@ func (m *Memory) OverflowCount() int64 { return m.overflowN.Load() }
 // KeyCount returns the number of tracked keys.
 func (m *Memory) KeyCount() int { return int(m.keys.Load()) }
 
-func (m *Memory) shardFor(k string) *shard {
-	h := fnv.New32a()
-	h.Write([]byte(k))
-	return &m.shards[h.Sum32()%numShards]
+func (m *Memory) shardFor(sk skey) *shard {
+	return &m.shards[maphash.String(m.seed, sk.key)%numShards]
 }
 
-func storeKey(a model.Algorithm, key string) string { return string(a) + "\x00" + key }
+func storeKey(a model.Algorithm, key string) skey { return skey{algo: a, key: key} }
 
 func (m *Memory) Allow(ctx context.Context, key string, p Params) (Decision, error) {
 	p, err := normalize(p)
@@ -446,18 +459,20 @@ func (e *entry) slidingLog(p Params, now int64, consume bool) Decision {
 	// Drop records that left the trailing window (ns <= now-win).
 	i := 0
 	for i < len(e.log) && e.log[i].ns <= now-win {
+		e.logSum -= e.log[i].n
 		i++
 	}
 	if i > 0 {
-		e.log = append(e.log[:0], e.log[i:]...)
+		// Reslice rather than shift: O(1) per call. The dropped prefix is
+		// released when append next reallocates (to ~2x the live records),
+		// so memory stays O(Limit) per key.
+		e.log = e.log[i:]
 	}
-	count := 0
-	for _, r := range e.log {
-		count += r.n
-	}
+	count := e.logSum // == sum of e.log[*].n, kept incrementally (O(1) per call)
 	allowed := p.Cost <= p.Limit && count+p.Cost <= p.Limit
 	if allowed && consume {
 		e.log = append(e.log, logRec{ns: now, n: p.Cost})
+		e.logSum += p.Cost
 		count += p.Cost
 	}
 	d := Decision{Allowed: allowed, Limit: p.Limit, Remaining: max(0, p.Limit-count)}

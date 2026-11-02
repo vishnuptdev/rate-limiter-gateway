@@ -3,6 +3,7 @@ package gateway
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"net/http"
 	"net/http/httputil"
 	"net/netip"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"ratelimitergateway/internal/model"
+	"ratelimitergateway/internal/ratelimit"
 )
 
 // compiled is the immutable, request-ready form of a Snapshot. It is built
@@ -21,6 +23,7 @@ type compiled struct {
 	routes    []*croute // sorted: priority desc, prefix length desc, id asc
 	byID      map[string]*croute
 	keys      map[string]*ckey      // lower-case sha256 hex -> key
+	keysBin   map[[32]byte]*ckey    // same entries keyed by the raw digest (hot path)
 	consumers map[string]*cconsumer // by ID
 	plans     map[string]*model.Plan
 	trusted   []netip.Prefix
@@ -86,6 +89,10 @@ type cpolicy struct {
 	failMode model.FailMode
 	cost     int
 	conc     bool
+	// policyHdr is the precomputed RateLimit-Policy value for the policy's
+	// own Limit/Window (overrides recompute it).
+	policyHdr string
+	nameJSON  string // json.Marshal(p.Name), for the 429 body
 }
 
 var credentialHeaders = map[string]bool{
@@ -105,6 +112,7 @@ func (g *Gateway) compile(s *model.Snapshot) *compiled {
 		snap:           s,
 		byID:           map[string]*croute{},
 		keys:           map[string]*ckey{},
+		keysBin:        map[[32]byte]*ckey{},
 		consumers:      map[string]*cconsumer{},
 		plans:          map[string]*model.Plan{},
 		legacyHeaders:  s.Settings.LegacyHeaders,
@@ -147,7 +155,15 @@ func (g *Gateway) compile(s *model.Snapshot) *compiled {
 		cc := &cconsumer{c: co, plan: c.plans[co.PlanID]}
 		c.consumers[co.ID] = cc
 		for j := range co.Keys {
-			c.keys[strings.ToLower(co.Keys[j].Hash)] = &ckey{k: &co.Keys[j], consumer: cc}
+			ck := &ckey{k: &co.Keys[j], consumer: cc}
+			c.keys[strings.ToLower(co.Keys[j].Hash)] = ck
+			// A stored hash that is not 64 hex digits can never equal a
+			// sha256 hex digest, so it can never match either way.
+			var d [32]byte
+			if b, err := hex.DecodeString(co.Keys[j].Hash); err == nil && len(b) == len(d) {
+				copy(d[:], b)
+				c.keysBin[d] = ck
+			}
 		}
 	}
 
@@ -231,6 +247,9 @@ func compilePolicy(p *model.Policy, c *compiled) *cpolicy {
 	if cp.cost <= 0 {
 		cp.cost = 1
 	}
+	cp.policyHdr = policyHeader(ratelimit.Params{Limit: p.Limit, Window: p.Window.D()})
+	nb, _ := json.Marshal(p.Name)
+	cp.nameJSON = string(nb)
 	for _, k := range p.KeyBy {
 		switch {
 		case k == "consumer":

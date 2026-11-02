@@ -2,6 +2,8 @@ package gateway
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"net/netip"
 	"strings"
@@ -16,7 +18,9 @@ import (
 type reqInfo struct {
 	method, host, path string
 	ip                 string
-	apiKey             string // presented key, "" if none
+	apiKey             string   // presented key, "" if none
+	keySum             [32]byte // sha256(apiKey), valid when keySumOK
+	keySumOK           bool
 	header             func(canonicalName string) string
 	query              func(name string) string
 	route              *croute
@@ -31,7 +35,12 @@ func (c *compiled) authenticate(key string, now time.Time) (*cconsumer, string) 
 	if key == "" {
 		return nil, ""
 	}
-	k := c.keys[hashHex(key)]
+	return c.authenticateSum(sha256.Sum256([]byte(key)), now)
+}
+
+// authenticateSum is authenticate for an already computed sha256 of the key.
+func (c *compiled) authenticateSum(sum [32]byte, now time.Time) (*cconsumer, string) {
+	k := c.keysBin[sum]
 	switch {
 	case k == nil:
 		return nil, "invalid API key"
@@ -43,6 +52,16 @@ func (c *compiled) authenticate(key string, now time.Time) (*cconsumer, string) 
 		return nil, "consumer disabled"
 	}
 	return k.consumer, ""
+}
+
+// authenticate resolves ri.apiKey, hashing it once and keeping the digest
+// for api_key bucket keys.
+func (ri *reqInfo) authenticate(c *compiled, now time.Time) (*cconsumer, string) {
+	if ri.apiKey == "" {
+		return nil, ""
+	}
+	ri.keySum, ri.keySumOK = sha256.Sum256([]byte(ri.apiKey)), true
+	return c.authenticateSum(ri.keySum, now)
 }
 
 // extractKey reads the API key from the configured header, falling back to
@@ -89,6 +108,9 @@ func (ri *reqInfo) part(kp keyPart) string {
 	case partAPIKey:
 		if ri.apiKey == "" {
 			return "-"
+		}
+		if ri.keySumOK {
+			return hex.EncodeToString(ri.keySum[:8]) // == hashHex(apiKey)[:16]
 		}
 		return hashHex(ri.apiKey)[:16]
 	case partIP:
@@ -178,6 +200,7 @@ type outcome struct {
 	best    *polResult // source of rate-limit headers
 	held    []heldSlot // concurrency slots to release after the response
 	soft    []string   // fail-open errors (notes)
+	inline  [2]polResult
 }
 
 type evalOpts struct {
@@ -197,7 +220,11 @@ func (g *Gateway) evaluate(ctx context.Context, ri *reqInfo, o evalOpts) *outcom
 	if o.costMul < 1 {
 		o.costMul = 1
 	}
-	out.results = make([]polResult, 0, len(ri.route.policies))
+	if len(ri.route.policies) <= len(out.inline) {
+		out.results = out.inline[:0]
+	} else {
+		out.results = make([]polResult, 0, len(ri.route.policies))
+	}
 	for _, cp := range ri.route.policies {
 		if o.skipConcurrency && cp.conc {
 			continue
@@ -300,13 +327,22 @@ func (c *compiled) isTrusted(a netip.Addr) bool {
 // An unparseable entry stops the walk (it is never trusted as an address).
 func (c *compiled) clientIP(remoteAddr string, xff []string) string {
 	peer := remoteAddr
+	var pa netip.Addr
+	parsed := false
 	if ap, err := netip.ParseAddrPort(remoteAddr); err == nil {
-		peer = ap.Addr().Unmap().String()
+		pa, parsed = ap.Addr().Unmap(), true
+		if ap.Addr().Is4() {
+			// netip only accepts canonical dotted-quad IPv4, so the host
+			// part is already exactly pa.String(); reuse it.
+			peer = remoteAddr[:strings.LastIndexByte(remoteAddr, ':')]
+		} else {
+			peer = pa.String()
+		}
 	} else if a, err := netip.ParseAddr(remoteAddr); err == nil {
-		peer = a.Unmap().String()
+		pa, parsed = a.Unmap(), true
+		peer = pa.String()
 	}
-	pa, err := netip.ParseAddr(peer)
-	if err != nil || len(c.trusted) == 0 || !c.isTrusted(pa) {
+	if !parsed || len(c.trusted) == 0 || !c.isTrusted(pa) {
 		return peer
 	}
 	var hops []string

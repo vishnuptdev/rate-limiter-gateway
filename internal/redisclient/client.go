@@ -12,6 +12,7 @@ package redisclient
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -20,6 +21,17 @@ import (
 	"strconv"
 	"strings"
 	"time"
+)
+
+// Upper bounds on server-announced lengths, so a corrupt or hostile reply
+// cannot make the client allocate unbounded memory up front (Redis' own
+// proto-max-bulk-len default is 512MB).
+const (
+	maxBulkLen  = 512 << 20
+	maxArrayLen = 1 << 24
+	// arrayPrealloc caps the capacity reserved from an announced array
+	// length; longer arrays grow by append as their elements arrive.
+	arrayPrealloc = 1024
 )
 
 // Options configures a Client.
@@ -144,68 +156,153 @@ type Reply struct {
 	IsNil bool
 }
 
+// encodeCommand returns the RESP encoding of args (used by tests; the
+// client writes straight into its buffered writer with writeCommand).
 func encodeCommand(args []string) []byte {
-	var b strings.Builder
-	fmt.Fprintf(&b, "*%d\r\n", len(args))
-	for _, a := range args {
-		fmt.Fprintf(&b, "$%d\r\n%s\r\n", len(a), a)
-	}
-	return []byte(b.String())
+	var b bytes.Buffer
+	w := bufio.NewWriter(&b)
+	writeCommand(w, args)
+	w.Flush()
+	return b.Bytes()
 }
 
-func readReply(r *bufio.Reader) (*Reply, error) {
-	line, err := r.ReadString('\n')
+// writeCommand encodes args as a RESP array of bulk strings directly into
+// w (no intermediate string, no fmt). bufio errors are sticky, so the
+// caller's Flush reports any write failure.
+func writeCommand(w *bufio.Writer, args []string) {
+	var num [20]byte
+	w.WriteByte('*')
+	w.Write(strconv.AppendInt(num[:0], int64(len(args)), 10))
+	w.WriteString("\r\n")
+	for _, a := range args {
+		w.WriteByte('$')
+		w.Write(strconv.AppendInt(num[:0], int64(len(a)), 10))
+		w.WriteString("\r\n")
+		w.WriteString(a)
+		w.WriteString("\r\n")
+	}
+}
+
+// readLine returns the next reply line without its CRLF. The slice is only
+// valid until the next read from r (it usually aliases r's buffer).
+func readLine(r *bufio.Reader) ([]byte, error) {
+	line, err := r.ReadSlice('\n')
+	if err == bufio.ErrBufferFull {
+		// Longer than the reader's buffer (e.g. a long error message).
+		// Copy first: line aliases the buffer the next read overwrites.
+		head := append([]byte(nil), line...)
+		var rest []byte
+		rest, err = r.ReadBytes('\n')
+		line = append(head, rest...)
+	}
 	if err != nil {
 		return nil, err
 	}
-	line = strings.TrimRight(line, "\r\n")
+	for len(line) > 0 && (line[len(line)-1] == '\n' || line[len(line)-1] == '\r') {
+		line = line[:len(line)-1]
+	}
+	return line, nil
+}
+
+// parseInt parses a RESP integer without allocating; malformed input falls
+// back to strconv for its error.
+func parseInt(b []byte) (int64, error) {
+	neg := false
+	d := b
+	if len(d) > 0 && (d[0] == '-' || d[0] == '+') {
+		neg = d[0] == '-'
+		d = d[1:]
+	}
+	if len(d) == 0 || len(d) > 18 {
+		return strconv.ParseInt(string(b), 10, 64)
+	}
+	var n int64
+	for _, c := range d {
+		if c < '0' || c > '9' {
+			return strconv.ParseInt(string(b), 10, 64)
+		}
+		n = n*10 + int64(c-'0')
+	}
+	if neg {
+		n = -n
+	}
+	return n, nil
+}
+
+func readReply(r *bufio.Reader) (*Reply, error) {
+	rep := new(Reply)
+	if err := readReplyInto(r, rep); err != nil {
+		return nil, err
+	}
+	return rep, nil
+}
+
+// readReplyInto parses one reply into rep.
+func readReplyInto(r *bufio.Reader, rep *Reply) error {
+	line, err := readLine(r)
+	if err != nil {
+		return err
+	}
 	if len(line) == 0 {
-		return nil, errors.New("redis: empty reply line")
+		return errors.New("redis: empty reply line")
 	}
 	switch line[0] {
 	case '+':
-		return &Reply{Type: '+', Str: line[1:]}, nil
+		*rep = Reply{Type: '+', Str: string(line[1:])}
 	case '-':
-		return &Reply{Type: '-', Str: line[1:]}, nil
+		*rep = Reply{Type: '-', Str: string(line[1:])}
 	case ':':
-		n, err := strconv.ParseInt(line[1:], 10, 64)
+		n, err := parseInt(line[1:])
 		if err != nil {
-			return nil, fmt.Errorf("redis: bad integer reply: %w", err)
+			return fmt.Errorf("redis: bad integer reply: %w", err)
 		}
-		return &Reply{Type: ':', Int: n}, nil
+		*rep = Reply{Type: ':', Int: n}
 	case '$':
-		n, err := strconv.Atoi(line[1:])
-		if err != nil {
-			return nil, fmt.Errorf("redis: bad bulk length: %w", err)
+		n, err := parseInt(line[1:])
+		if err != nil || n < -1 || n > maxBulkLen {
+			if err == nil {
+				err = strconv.ErrRange
+			}
+			return fmt.Errorf("redis: bad bulk length: %w", err)
 		}
 		if n == -1 {
-			return &Reply{Type: '$', IsNil: true}, nil
+			*rep = Reply{Type: '$', IsNil: true}
+			return nil
 		}
 		buf := make([]byte, n+2) // + trailing CRLF
 		if _, err := readFull(r, buf); err != nil {
-			return nil, err
+			return err
 		}
-		return &Reply{Type: '$', Str: string(buf[:n])}, nil
+		*rep = Reply{Type: '$', Str: string(buf[:n])}
 	case '*':
-		n, err := strconv.Atoi(line[1:])
-		if err != nil {
-			return nil, fmt.Errorf("redis: bad array length: %w", err)
+		n, err := parseInt(line[1:])
+		if err != nil || n < -1 || n > maxArrayLen {
+			if err == nil {
+				err = strconv.ErrRange
+			}
+			return fmt.Errorf("redis: bad array length: %w", err)
 		}
 		if n == -1 {
-			return &Reply{Type: '*', IsNil: true}, nil
+			*rep = Reply{Type: '*', IsNil: true}
+			return nil
 		}
-		items := make([]*Reply, n)
-		for i := 0; i < n; i++ {
-			item, err := readReply(r)
-			if err != nil {
-				return nil, err
+		// Never trust the announced length for up-front allocation: a
+		// hostile "*16777215" header must not cost ~1GB before a single
+		// element arrives. Start small and grow only as elements are
+		// actually read (maxArrayLen still caps the total).
+		items := make([]*Reply, 0, min(n, arrayPrealloc))
+		for i := int64(0); i < n; i++ {
+			item := new(Reply)
+			if err := readReplyInto(r, item); err != nil {
+				return err
 			}
-			items[i] = item
+			items = append(items, item)
 		}
-		return &Reply{Type: '*', Array: items}, nil
+		*rep = Reply{Type: '*', Array: items}
 	default:
-		return nil, fmt.Errorf("redis: unknown reply type byte %q", line[0])
+		return fmt.Errorf("redis: unknown reply type byte %q", line[0])
 	}
+	return nil
 }
 
 func readFull(r *bufio.Reader, buf []byte) (int, error) {
@@ -229,9 +326,7 @@ func (c *Client) roundTrip(cn *conn, dl time.Time, args []string) (*Reply, error
 		d = dl
 	}
 	cn.nc.SetDeadline(d)
-	if _, err := cn.w.Write(encodeCommand(args)); err != nil {
-		return nil, err
-	}
+	writeCommand(cn.w, args)
 	if err := cn.w.Flush(); err != nil {
 		return nil, err
 	}

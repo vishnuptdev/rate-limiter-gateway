@@ -303,7 +303,11 @@ func (g *Gateway) serveProxy(w http.ResponseWriter, r *http.Request, cleaned str
 	}
 	var out *outcome
 	var st *reqState
+	reserved := false // holds one global shaping-waiter slot
 	defer func() {
+		if reserved {
+			g.shapeWaiters.Add(-1)
+		}
 		if out != nil {
 			g.releaseSlots(out.held)
 		}
@@ -378,6 +382,26 @@ func (g *Gateway) serveProxy(w http.ResponseWriter, r *http.Request, cleaned str
 		r.Body = http.MaxBytesReader(w, r.Body, cfg.maxBody)
 	}
 
+	// Routes with an enforcing leaky bucket reserve a global waiter slot
+	// BEFORE the engine is consulted: a rejection after Allow would already
+	// have advanced the bucket (phantom backlog charged to retrying clients).
+	if route.shaper != nil {
+		if g.shapeWaiters.Add(1) > g.maxShapeWaiters {
+			g.shapeWaiters.Add(-1)
+			prm, _ := ri.effective(route.shaper, 1)
+			res := &polResult{cp: route.shaper, params: prm, composite: ri.composite(route.shaper),
+				dec: ratelimit.Decision{Limit: prm.Burst, ResetAfter: time.Second, RetryAfter: time.Second}}
+			if res.dec.Limit == 0 {
+				res.dec.Limit = prm.Limit
+			}
+			le.PolicyID, le.RateKey, le.Limit = route.shaper.p.ID, res.composite, res.dec.Limit
+			le.Decision, le.Error = model.DecisionLimited, "shaping_queue_full"
+			g.writeLimited(w, cfg, res, start)
+			return
+		}
+		reserved = true
+	}
+
 	ectx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	out = g.evaluate(ectx, ri, evalOpts{costMul: 1})
 	cancel()
@@ -402,18 +426,7 @@ func (g *Gateway) serveProxy(w http.ResponseWriter, r *http.Request, cleaned str
 	case out.denier != nil:
 		d := out.denier
 		le.Decision = model.DecisionLimited
-		hdrs := rateHeaders(cfg, d, start, true)
-		for k, v := range hdrs {
-			w.Header().Set(k, v)
-		}
-		if cfg.exposeDecision {
-			w.Header().Set("X-RateGuard-Policy", d.cp.p.ID)
-		}
-		retry := retryAfterSeconds(d.dec)
-		writeJSON(w, http.StatusTooManyRequests, map[string]any{
-			"error": "rate_limited", "message": "Rate limit exceeded", "policy": d.cp.p.Name,
-			"limit": limitOf(d), "remaining": 0, "retry_after_s": retry, "reset_s": ceilSeconds(d.dec.ResetAfter),
-		})
+		g.writeLimited(w, cfg, d, start)
 		return
 	case out.shadow:
 		le.Decision = model.DecisionShadowLimited
@@ -429,29 +442,29 @@ func (g *Gateway) serveProxy(w http.ResponseWriter, r *http.Request, cleaned str
 	// Leaky-bucket shaping: hold the admitted request until its queue slot
 	// comes up. A client that disconnects while queued is not proxied; its
 	// concurrency slots (if any) are released by the deferred releaseSlots.
-	if wait, tooLong := out.shapingDelay(); wait > 0 {
-		reject := ""
-		if tooLong {
-			reject = "shaping_delay_too_long"
-		} else if g.shapeWaiters.Add(1) > g.maxShapeWaiters {
-			g.shapeWaiters.Add(-1)
-			reject = "shaping_queue_full"
-		}
-		if reject != "" {
-			le.Decision, le.Error = model.DecisionLimited, reject
-			w.Header().Set("Retry-After", "1")
-			writeJSON(w, http.StatusTooManyRequests, map[string]any{
-				"error": "rate_limited", "message": "Request queue is full", "retry_after_s": 1,
-			})
-			return
-		}
+	wait, tooLongSrc, tooLong := out.shapingDelay()
+	if tooLong {
+		// Defensive only: store.Validate bounds the delay below the ceiling.
+		// Allow has already consumed the slot and nothing refunds it; this is
+		// acceptable because the path is unreachable for validated config, and
+		// releasing the request early would break the shaping rate.
+		le.PolicyID, le.RateKey, le.Limit = tooLongSrc.cp.p.ID, tooLongSrc.composite, limitOf(tooLongSrc)
+		le.Decision, le.Error = model.DecisionLimited, "shaping_delay_too_long"
+		g.writeLimited(w, cfg, tooLongSrc, start)
+		return
+	}
+	if wait <= 0 && reserved {
+		reserved = false
+		g.shapeWaiters.Add(-1)
+	}
+	if wait > 0 {
 		timer := time.NewTimer(wait)
 		select {
 		case <-timer.C:
+			reserved = false
 			g.shapeWaiters.Add(-1)
 		case <-r.Context().Done():
 			timer.Stop()
-			g.shapeWaiters.Add(-1)
 			le.Decision, le.Error = model.DecisionError, "client_closed"
 			w.WriteHeader(499) // nginx convention: client closed request
 			return
@@ -498,6 +511,21 @@ func (g *Gateway) record(cfg *compiled, le model.LogEntry) {
 		}
 	}
 	g.recorder.Record(le)
+}
+
+// writeLimited writes the standard 429 response for a denied (or shaping
+// rejected) policy result: RateLimit-* headers, Retry-After and the JSON body.
+func (g *Gateway) writeLimited(w http.ResponseWriter, cfg *compiled, d *polResult, start time.Time) {
+	for k, v := range rateHeaders(cfg, d, start, true) {
+		w.Header().Set(k, v)
+	}
+	if cfg.exposeDecision {
+		w.Header().Set("X-RateGuard-Policy", d.cp.p.ID)
+	}
+	writeJSON(w, http.StatusTooManyRequests, map[string]any{
+		"error": "rate_limited", "message": "Rate limit exceeded", "policy": d.cp.p.Name,
+		"limit": limitOf(d), "remaining": 0, "retry_after_s": retryAfterSeconds(d.dec), "reset_s": ceilSeconds(d.dec.ResetAfter),
+	})
 }
 
 func limitOf(r *polResult) int {

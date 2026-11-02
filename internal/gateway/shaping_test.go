@@ -127,10 +127,10 @@ func TestShapingDelayNeverReleasesEarly(t *testing.T) {
 		}}}
 	}
 	// Delay beyond the policy window is honoured (burst > limit), shadow ignored.
-	if d, tooLong := mk(5 * time.Second).shapingDelay(); d != 5*time.Second || tooLong {
+	if d, _, tooLong := mk(5 * time.Second).shapingDelay(); d != 5*time.Second || tooLong {
 		t.Fatalf("delay %v tooLong=%v", d, tooLong)
 	}
-	if _, tooLong := mk(31 * time.Second).shapingDelay(); !tooLong {
+	if _, src, tooLong := mk(31 * time.Second).shapingDelay(); src == nil || !tooLong {
 		t.Fatal("delay above the hard ceiling must be denied, not clamped")
 	}
 }
@@ -152,8 +152,17 @@ func TestShapingQueueFullAndDeniedBeyondCeiling(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	rr := e.get(context.Background())
-	if rr.Code != 429 || rr.Header().Get("Retry-After") != "1" {
+	if rr.Code != 429 || rr.Header().Get("Retry-After") != "1" || rr.Header().Get("RateLimit-Limit") != "4" {
 		t.Fatalf("waiter cap: %d %v", rr.Code, rr.Header())
+	}
+	body := jsonBody(t, rr)
+	if body["policy"] != "Policy lb" || body["retry_after_s"] != float64(1) || body["remaining"] != float64(0) || body["limit"] != float64(4) {
+		t.Fatalf("429 body: %v", body)
+	}
+	// The rejection must not have consumed: backlog is exactly the 3 admitted requests.
+	d, _, _ := e.mem.Peek(context.Background(), e.g.EngineKey("lb", "global"), ratelimit.Params{Algorithm: model.AlgoLeakyBucket, Limit: 1, Window: 10 * time.Second, Burst: 4})
+	if d.Delay < 29*time.Second || d.Delay > 30*time.Second {
+		t.Fatalf("phantom backlog after queue-full rejection: delay %v want ~30s", d.Delay)
 	}
 	if le := e.rec.last(t); le.Error != "shaping_queue_full" {
 		t.Fatalf("log: %+v", le)
@@ -184,5 +193,44 @@ func TestCheckAPIReportsDelayMs(t *testing.T) {
 	}
 	if e.hits.Load() != 0 {
 		t.Fatal("check API must not proxy")
+	}
+}
+
+type delayEngine struct {
+	*ratelimit.Memory
+	delay time.Duration
+}
+
+func (d delayEngine) Allow(ctx context.Context, key string, p ratelimit.Params) (ratelimit.Decision, error) {
+	dec, err := d.Memory.Allow(ctx, key, p)
+	if dec.Allowed && p.Algorithm == model.AlgoLeakyBucket {
+		dec.Delay = d.delay
+	}
+	return dec, err
+}
+
+func TestShapingCeilingDeniesProxyAndCheck(t *testing.T) {
+	e := newShapeEnv(t, leaky("lb", 10, time.Second, 3))
+	e.g.engine = delayEngine{e.mem, 31 * time.Second}
+	rr := e.get(context.Background())
+	if rr.Code != 429 || rr.Header().Get("Retry-After") == "" || rr.Header().Get("RateLimit-Limit") != "3" {
+		t.Fatalf("proxy: %d %v", rr.Code, rr.Header())
+	}
+	if e.hits.Load() != 0 {
+		t.Fatal("must not proxy")
+	}
+	if le := e.rec.last(t); le.Decision != model.DecisionLimited || le.Error != "shaping_delay_too_long" {
+		t.Fatalf("log: %+v", le)
+	}
+	if n := e.g.shapeWaiters.Load(); n != 0 {
+		t.Fatalf("reservation leaked: %d", n)
+	}
+	r := httptest.NewRequest("POST", "/_rlg/v1/check", strings.NewReader(`{"route_id":"r"}`))
+	r.Header.Set("Authorization", "Bearer chk")
+	crr := httptest.NewRecorder()
+	e.g.ServeHTTP(crr, r)
+	m := jsonBody(t, crr)
+	if m["allowed"] != false || m["decision"] != model.DecisionLimited || m["retry_after_s"].(float64) < 1 {
+		t.Fatalf("check: %v", m)
 	}
 }

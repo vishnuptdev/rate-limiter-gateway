@@ -206,6 +206,7 @@ func (g *Gateway) serveCheck(w http.ResponseWriter, r *http.Request) {
 		le.PolicyID, le.RateKey, le.Limit, le.Remaining = b.cp.p.ID, b.composite, resp.Limit, resp.Remaining
 		resp.Headers = rateHeaders(cfg, b, start, out.denier != nil)
 	}
+	_, tooLongSrc, _ := out.shapingDelay()
 	switch {
 	case out.failed != nil:
 		f := out.failed
@@ -216,6 +217,12 @@ func (g *Gateway) serveCheck(w http.ResponseWriter, r *http.Request) {
 	case out.denier != nil:
 		resp.Decision = model.DecisionLimited
 		resp.RetryAfterS = retryAfterSeconds(out.denier.dec)
+		finish(http.StatusTooManyRequests)
+	case tooLongSrc != nil:
+		// Defensive: validation keeps shaping delays under the ceiling.
+		resp.Decision = model.DecisionLimited
+		resp.RetryAfterS = retryAfterSeconds(tooLongSrc.dec)
+		le.Error = "shaping_delay_too_long"
 		finish(http.StatusTooManyRequests)
 	case out.shadow:
 		resp.Allowed, resp.Decision = true, model.DecisionShadowLimited
@@ -229,6 +236,6 @@ func (g *Gateway) serveCheck(w http.ResponseWriter, r *http.Request) {
 }
 
 func shapeMs(o *outcome) int64 {
-	d, _ := o.shapingDelay()
+	d, _, _ := o.shapingDelay()
 	return d.Milliseconds()
 }

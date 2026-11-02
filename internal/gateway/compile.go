@@ -41,6 +41,7 @@ type croute struct {
 	prefix   string // normalised: no trailing slash; "" matches everything
 	methods  map[string]bool
 	policies []*cpolicy
+	shaper   *cpolicy // first enforcing leaky bucket policy in the chain, or nil
 	target   *url.URL
 	proxy    *httputil.ReverseProxy
 	timeout  time.Duration
@@ -188,6 +189,12 @@ func (g *Gateway) compile(s *model.Snapshot) *compiled {
 			cr.methods[strings.ToUpper(m)] = true
 		}
 		cr.policies = chain(s.Settings.GlobalPolicyIDs, r.PolicyIDs)
+		for _, cp := range cr.policies {
+			if cp.p.Algorithm == model.AlgoLeakyBucket && cp.mode != model.ModeShadow {
+				cr.shaper = cp
+				break
+			}
+		}
 		cr.target, _ = url.Parse(r.Upstream)
 		cr.proxy = g.proxyFor(r.Upstream, cr.target)
 		used[r.Upstream] = true

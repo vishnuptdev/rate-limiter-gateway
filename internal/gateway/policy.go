@@ -340,19 +340,20 @@ const maxShapingDelay = 30 * time.Second
 
 // shapingDelay is how long an admitted request must wait before proceeding:
 // the largest leaky-bucket queue delay among the enforcing policies (shadow
-// policies never delay traffic). tooLong reports a delay above the ceiling.
-func (o *outcome) shapingDelay() (d time.Duration, tooLong bool) {
+// policies never delay traffic). When a decision's delay exceeds the ceiling
+// it returns tooLong with that policy's result in src.
+func (o *outcome) shapingDelay() (d time.Duration, src *polResult, tooLong bool) {
 	for i := range o.results {
 		r := &o.results[i]
 		if !r.called || r.denied || r.cp.mode == model.ModeShadow || r.dec.Delay <= 0 {
 			continue
 		}
 		if r.dec.Delay > maxShapingDelay {
-			return r.dec.Delay, true
+			return r.dec.Delay, r, true
 		}
 		if r.dec.Delay > d {
 			d = r.dec.Delay
 		}
 	}
-	return d, false
+	return d, nil, false
 }

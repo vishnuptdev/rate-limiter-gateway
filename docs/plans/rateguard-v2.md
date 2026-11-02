@@ -72,3 +72,26 @@ Only from spec; no Go code outside examples/go.
 `cmd/rateguard/main.go`: env config, wire everything, demo mode (`RLG_DEMO=true` seeds
 routes/policies/plans/consumer + dummy upstream), graceful shutdown, server timeouts. Remove
 `cmd/gateway`, `internal/limiter`, `internal/proxy`, `internal/config`. End-to-end test.
+
+### Task 8: More algorithms — GCRA and leaky bucket (shaping)
+Dirs: `internal/model/` (add constants only), `internal/ratelimit/`, `internal/store/validate.go`, `internal/gateway/`, docs table in README.
+- `AlgoGCRA = "gcra"`: Generic Cell Rate Algorithm (Stripe/Redis-cell style). State = one int64 TAT per key.
+  Emission interval T = Window/Limit; tolerance τ = T*(Burst-1) (Burst 0 => Limit). Allow iff TAT - now <= τ; then
+  TAT = max(TAT, now) + T*Cost. RetryAfter = TAT - τ - now when denied. Remaining = floor((τ - (TAT-now))/T)+... clamp >= 0.
+  Memory: lock-free CAS on an atomic int64 per key. Redis: single Lua script with server TIME, 1 key (string), PEXPIRE.
+- `AlgoLeakyBucket = "leaky_bucket"`: queue-based traffic shaping. Requests drain at Limit/Window; Burst = queue size (0 => Limit).
+  A request that fits in the queue is ALLOWED with a `Delay` (new field `Decision.Delay time.Duration`): the gateway waits that
+  long (context-aware, aborted on client disconnect) before proxying; if the queue is full -> denied (429) with RetryAfter.
+  Check API returns `delay_ms` instead of sleeping. Memory + Redis (Lua) implementations.
+- `model.Algorithms` gains both; Validate accepts them; Simulator shows them; README algorithm table lists 7 algorithms with when-to-use.
+- Tests: exact semantics with fake clock, -race concurrency (exactly the allowed count), Redis shared-state tests, gateway delay test.
+
+### Task 9: Performance — near-zero added latency
+Dirs: `internal/gateway/`, `internal/ratelimit/`, `internal/telemetry/`, `internal/redisclient/`, `docs/PERFORMANCE.md`.
+- Add benchmarks: engine Allow per algorithm (memory, parallel), gateway ServeHTTP overhead with a no-op upstream (allowed + 429 paths),
+  check API, telemetry Record. Profile (`-cpuprofile`, `-memprofile`), then optimise the hot path: zero/near-zero allocations
+  for key building and header writing, avoid fmt in hot path, precompute per-policy header strings at compile time, sync.Pool where useful,
+  reverse proxy transport tuning (MaxIdleConnsPerHost, HTTP/2, keep-alives, buffer pool), Redis: pipeline/EVALSHA only, connection pool sizing,
+  memory engine: avoid time.Now per call where safe (coarse clock with ≤1ms resolution, option), shard by maphash.
+- Target and report: memory engine Allow < 100ns/op parallel; gateway overhead (excluding upstream) p50 < 50µs; 0-2 allocs on engine path.
+- Write docs/PERFORMANCE.md with real numbers from this machine (before/after table) and tuning guide.

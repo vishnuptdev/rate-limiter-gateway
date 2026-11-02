@@ -109,24 +109,25 @@ func newTransport() *http.Transport {
 
 // bufferPool recycles the 32KB copy buffers ReverseProxy would otherwise
 // allocate for every proxied response body (the dominant allocation on the
-// proxy path). Pointers to slices are pooled to avoid an allocation per Put.
+// proxy path). httputil.BufferPool hands buffers over as []byte, so the
+// pool stores *[proxyBufSize]byte (a single pointer: no extra allocation
+// per Put) and converts back with a slice expression.
 type bufferPool struct{ p sync.Pool }
 
 const proxyBufSize = 32 << 10
 
 func (b *bufferPool) Get() []byte {
-	if v, ok := b.p.Get().(*[]byte); ok {
-		return *v
+	if v, ok := b.p.Get().(*[proxyBufSize]byte); ok {
+		return v[:]
 	}
-	return make([]byte, proxyBufSize)
+	return new([proxyBufSize]byte)[:]
 }
 
 func (b *bufferPool) Put(buf []byte) {
 	if cap(buf) != proxyBufSize {
 		return
 	}
-	buf = buf[:proxyBufSize]
-	b.p.Put(&buf)
+	b.p.Put((*[proxyBufSize]byte)(buf[:proxyBufSize]))
 }
 
 var proxyBuffers = &bufferPool{}

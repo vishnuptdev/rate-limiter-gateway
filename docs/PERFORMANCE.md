@@ -26,32 +26,46 @@ allocation counts are exact.
 
 | What | Before | After |
 |---|---|---|
-| Gateway proxy path, in process (no network), allocations | 83 allocs, 37.8 KiB | **53 allocs, 5.1 KiB** |
-| Gateway proxy path, throughput-normalised (4 goroutines) | 26.9 µs/op | **7.1 µs/op** (−74%) |
-| Gateway proxy path, one core (`-cpu 1`) | 22–46 µs/op | **16–18 µs/op** |
+| Gateway proxy path, in process (no network), allocations | 83 allocs, 37.8 KiB | **52 allocs, 5.1 KiB** |
+| Gateway proxy path, in process, throughput-normalised (4 goroutines) | 26.9 µs/op | **7.1 µs/op** (−74%) |
+| Gateway proxy path, in process, one core (`-cpu 1`) | 22–46 µs/op | **16–18 µs/op** |
+| Full proxied request over loopback, 1 client, p50 | 342 µs (direct 115 µs) | **342 µs** (direct 122 µs): unchanged, dominated by the extra HTTP hop |
 | 429 response, in process | 6.3 µs/op, 76 allocs | **4.2 µs/op, 26 allocs** |
 | Forward-auth decision, in process | 4.3 µs/op, 54 allocs | **3.3 µs/op, 22 allocs** |
-| Memory engine `Allow`, allocations | 1 (2 for concurrency) | **0** (1 for concurrency when a lease slice grows) |
-| Memory engine `Allow`, 1k hot keys, 4 goroutines | not measured before | **~100–125 ns/op** (token bucket, GCRA, leaky, fixed, counter) |
+| Memory engine `Allow`, allocations | 1 (2 for concurrency) | **0** amortised (1 for concurrency; the sliding log reallocates occasionally, a few B/op) |
+| Memory engine `Allow`, 1k hot keys, 4 goroutines | not measured before | 118–139 ns/op (200 ns concurrency): **target of < 100 ns not met** |
+| Memory engine `Allow`, 100k keys, 4 goroutines | 180–323 ns/op | 190–250 ns/op (mostly unchanged; cache misses) |
 | Memory engine sliding-window log, serial | 1429 ns/op (O(Limit) per call) | **~220–240 ns/op** (O(1)) |
-| Redis engine `Allow`, allocations | 35–58 allocs, ~1.6 KiB | **9–18 allocs, ~0.75 KiB** (round trip time unchanged: Redis dominates) |
+| Redis engine `Allow`, allocations | 35–58 allocs, ~1.6 KiB | **14–23 allocs, ~0.75 KiB** (round trip time unchanged: Redis dominates) |
 | Forward auth over loopback, 1 client, p50 | 151 µs (direct upstream 115 µs) | **137 µs** (direct 122 µs): about **15 µs added** |
 | Proxy over loopback, 8 clients | 13.3k rps, p99 3.5 ms | **18.8k rps, p99 2.0 ms** |
 
 The targets from the brief were:
 
-- **Gateway overhead under 50 µs at p50: met.** The full proxy path takes
-  16–18 µs on one core. A forward-auth decision adds about 15 µs at p50 over
-  a direct request on the wire.
-- **Memory engine `Allow` under 100 ns/op in parallel: met only at the
-  boundary.** With 1k hot keys the result is 100–125 ns/op. With 100k keys
-  it is about 190–250 ns/op, because a request then usually misses the CPU
-  cache. With one hot key shared by every goroutine it is about 300–350
-  ns/op, because all goroutines wait on that key's mutex. Most of the
-  remaining cost is `time.Now` (about 35 ns on this VM's clock source), the
-  shard mutex and the map lookup.
+- **Gateway overhead under 50 µs at p50: met for RateGuard's own work
+  only.** In process, with no network, the full proxy path (routing, key
+  auth, engine, headers, `ReverseProxy` plumbing, log entry) takes 16–18 µs
+  on one core. Over loopback, a forward-auth decision adds about 15 µs at
+  p50 over a direct request (137 µs vs 122 µs). **A full proxied request
+  is much slower:** 342 µs at p50 versus 122 µs direct, with 1 client. Those
+  extra ~220 µs are not RateGuard's logic. They come from a second HTTP
+  round trip (gateway to upstream) and the `net/http` client and server
+  goroutine handoffs, and goroutine wake-ups are slow in this microVM. This
+  number did not change with the optimisations. Proxying through any HTTP
+  reverse proxy pays the cost of the extra hop.
+- **Memory engine `Allow` under 100 ns/op in parallel: not met.** The best
+  case is 118–139 ns/op, with 1k hot keys whose state fits in the CPU
+  cache. With 100k keys it is 190–250 ns/op, because most lookups then miss
+  the cache (memory latency). With one hot key shared by every goroutine it
+  is about 300–350 ns/op, because all goroutines wait on that key's shard
+  mutex. Of the remaining cost, `time.Now` is about 35 ns on this VM's clock
+  source. The rest is the shard mutex, the map lookup and the algorithm.
+  The coarse clock that would have removed the `time.Now` cost was
+  deliberately not built (see below).
 - **0–2 allocations on the engine path: met.** The memory engine makes 0
-  allocations, or 1 for concurrency.
+  allocations, or 1 for concurrency. For the sliding log the 0 is amortised:
+  reslicing makes `append` reallocate occasionally, which shows as a few
+  B/op. The Redis engine path makes 14–23 allocations, down from 35–58.
 
 ## Micro-benchmarks (before → after)
 
@@ -69,11 +83,11 @@ The benchmarks use the real memory engine and a no-op recorder.
 
 | Benchmark | sec/op | B/op | allocs/op |
 |---|---|---|---|
-| GatewayProxyAllowed (per-IP token bucket) | 26.9 µs → 7.1 µs | 37.8 KiB → 5.1 KiB | 83 → 53 |
-| GatewayProxyAllowedAPIKey (key auth + per-consumer) | 29.0 µs → 8.3 µs | 38.0 KiB → 5.2 KiB | 89 → 56 |
+| GatewayProxyAllowed (per-IP token bucket) | 26.9 µs → 7.1 µs | 37.8 KiB → 5.1 KiB | 83 → 52 |
+| GatewayProxyAllowedAPIKey (key auth + per-consumer) | 29.0 µs → 8.3 µs | 38.0 KiB → 5.2 KiB | 89 → 55 |
 | GatewayLimited (429) | 6.3 µs → 4.2 µs | 4.7 KiB → 3.2 KiB | 76 → 26 |
 | ForwardAuthAllowed | 4.3 µs → 3.3 µs | 2.8 KiB → 2.0 KiB | 54 → 22 |
-| CheckAPI (JSON in, JSON out) | 14.7 µs → 14.1 µs (noise) | 11.3 KiB → 11.2 KiB | 87 → 77 |
+| CheckAPI (JSON in, JSON out) | 14.7 µs → 12.6 µs (within noise) | 11.3 KiB → 11.2 KiB | 87 → 73 |
 
 ### Memory engine (`internal/ratelimit/bench_test.go`)
 
@@ -101,7 +115,7 @@ landed within noise of the baseline. An earlier run of the same code gave
 | | token bucket | sliding log | counter | fixed | concurrency* | GCRA | leaky |
 |---|---|---|---|---|---|---|---|
 | sec/op | 46 → 49 µs | 61 → 62 µs | 51 → 48 µs | 45 → 42 µs | 94 → 89 µs | 49 → 49 µs | 46 → 48 µs |
-| allocs/op | 37 → 10 | 38 → 11 | 35 → 9 | 35 → 9 | 58 → 18 | 40 → 10 | 40 → 10 |
+| allocs/op | 37 → 15 | 38 → 16 | 35 → 14 | 35 → 14 | 58 → 23 | 40 → 16 | 40 → 16 |
 
 The Redis round trip and the Lua script dominate the time. The client
 changes save allocations, which means less GC work under load, but they do
@@ -213,10 +227,14 @@ The changes are listed by commit, in order:
      Memory stays O(Limit) per key.
 5. **Redis client.**
    - Commands are encoded straight into the `bufio.Writer`, without `fmt`.
-   - Replies are read with `ReadSlice`, integers are parsed in place, and
-     array elements are allocated in a single slice.
-   - Lengths announced by the server are now bounded, and a corrupt
-     negative length returns an error instead of panicking.
+   - Replies are read with `ReadSlice` and integers are parsed in place.
+   - Lengths announced by the server are bounded: 512 MB for a bulk string
+     and 16M elements for an array. A corrupt negative length returns an
+     error instead of panicking.
+   - Array storage is never sized from the announced length. At most 1024
+     slots are reserved up front, and the array grows only as elements are
+     actually read. A hostile `*16777215` header followed by EOF therefore
+     allocates almost nothing (there is a test for this).
    - Scripts were already run with `EVALSHA`, falling back to `EVAL`.
 
 **Security properties are unchanged.**
@@ -229,9 +247,19 @@ The changes are listed by commit, in order:
 - Every memory bound is kept: the key cap, overflow buckets, O(Limit) log
   memory and the pool sizes.
 
-**Semantics are unchanged.** Every existing test passes with `-race`. The new
-equivalence tests pin the header writer, the 429 body, the
-reserved-header check and RESP parsing to the old forms.
+**Semantics are unchanged.** Every existing test passes with `-race`.
+
+New tests pin the following to the old forms or to expected values:
+
+- the header writer
+- the 429 body
+- the reserved-header check
+- RESP parsing
+- `cleanPath` and `clientIP` edge cases (traversal, `%2F`/`%2f`, NUL,
+  backslash, trailing slash, IPv6 with a zone, mapped addresses, the
+  trusted XFF walk). The same expectations also pass on the pre-change code.
+- the sliding log against a naive recount reference, including `Cost` > 1
+  and limit or window changes between calls.
 
 ### Tried and not kept, or deliberately not done
 
@@ -239,9 +267,13 @@ reserved-header check and RESP parsing to the old forms.
   syscall per response, but throughput moved within noise (17.6k to 18.0k
   rps). It would also change how quickly a slowly trickling body is
   forwarded, so the immediate flush (`-1`) was kept.
-- **A coarse clock for the memory engine.** `time.Now` costs about 35 ns
-  here, but a coarse clock lowers the time resolution of every algorithm.
-  It was left out to keep semantics identical.
+- **A coarse clock for the memory engine: decided against.** The brief
+  suggested an opt-in clock with a resolution of 1 ms or better. `time.Now`
+  costs about 35 ns here, so the clock would have saved about that much per
+  call. It would also make every algorithm's timing (refill, window edges,
+  `Retry-After`, shaping delays) only as precise as its tick. We chose exact
+  timing over a few nanoseconds, so the engine reads the real clock on
+  every call.
 - **A per-key cache of sha256 results.** Hashing a key of about 40 bytes is
   a small part of the cost, and a cache keyed by the plaintext key would
   keep secrets in memory.

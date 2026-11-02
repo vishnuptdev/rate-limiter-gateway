@@ -1,7 +1,6 @@
 package gateway
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -187,7 +186,7 @@ func (g *Gateway) serveCheck(w http.ResponseWriter, r *http.Request) {
 		le.ConsumerID, le.ConsumerName = cons.c.ID, cons.c.Name
 	}
 
-	ectx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	ectx, cancel := g.engineCtx(r.Context())
 	out := g.evaluate(ectx, ri, evalOpts{skipConcurrency: true, costMul: req.Cost})
 	cancel()
 	for _, s := range out.soft {

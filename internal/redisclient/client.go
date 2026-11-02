@@ -29,6 +29,9 @@ import (
 const (
 	maxBulkLen  = 512 << 20
 	maxArrayLen = 1 << 24
+	// arrayPrealloc caps the capacity reserved from an announced array
+	// length; longer arrays grow by append as their elements arrive.
+	arrayPrealloc = 1024
 )
 
 // Options configures a Client.
@@ -234,8 +237,7 @@ func readReply(r *bufio.Reader) (*Reply, error) {
 	return rep, nil
 }
 
-// readReplyInto parses one reply into rep. Array elements are allocated
-// together (one []Reply plus one []*Reply per array).
+// readReplyInto parses one reply into rep.
 func readReplyInto(r *bufio.Reader, rep *Reply) error {
 	line, err := readLine(r)
 	if err != nil {
@@ -284,13 +286,17 @@ func readReplyInto(r *bufio.Reader, rep *Reply) error {
 			*rep = Reply{Type: '*', IsNil: true}
 			return nil
 		}
-		vals := make([]Reply, n)
-		items := make([]*Reply, n)
-		for i := range vals {
-			if err := readReplyInto(r, &vals[i]); err != nil {
+		// Never trust the announced length for up-front allocation: a
+		// hostile "*16777215" header must not cost ~1GB before a single
+		// element arrives. Start small and grow only as elements are
+		// actually read (maxArrayLen still caps the total).
+		items := make([]*Reply, 0, min(n, arrayPrealloc))
+		for i := int64(0); i < n; i++ {
+			item := new(Reply)
+			if err := readReplyInto(r, item); err != nil {
 				return err
 			}
-			items[i] = &vals[i]
+			items = append(items, item)
 		}
 		*rep = Reply{Type: '*', Array: items}
 	default:

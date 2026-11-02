@@ -2,6 +2,7 @@ package redisclient
 
 import (
 	"bufio"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -11,6 +12,38 @@ func TestEncodeCommand(t *testing.T) {
 	want := "*5\r\n$7\r\nEVALSHA\r\n$3\r\nabc\r\n$1\r\n1\r\n$1\r\nk\r\n$0\r\n\r\n"
 	if got != want {
 		t.Fatalf("got %q want %q", got, want)
+	}
+}
+
+// A hostile array header announcing ~16M elements followed by EOF must not
+// make the client reserve memory for the announced length.
+func TestHostileArrayHeaderDoesNotPreallocate(t *testing.T) {
+	for _, hdr := range []string{"*16777215\r\n", "*16777215\r\n:1\r\n:2\r\n", "*1000000\r\n*1000000\r\n"} {
+		runtime.GC()
+		var before, after runtime.MemStats
+		runtime.ReadMemStats(&before)
+		_, err := readReply(bufio.NewReader(strings.NewReader(hdr)))
+		runtime.ReadMemStats(&after)
+		if err == nil {
+			t.Fatalf("%q: truncated array accepted", hdr)
+		}
+		if d := after.TotalAlloc - before.TotalAlloc; d > 1<<20 {
+			t.Errorf("%q: allocated %d bytes for a truncated reply", hdr, d)
+		}
+	}
+	if _, err := readReply(bufio.NewReader(strings.NewReader("*16777217\r\n"))); err == nil ||
+		!strings.Contains(err.Error(), "bad array length") {
+		t.Errorf("over-cap array length: %v", err)
+	}
+	// A legitimately long array still parses (grows past the prealloc).
+	var b strings.Builder
+	b.WriteString("*3000\r\n")
+	for i := 0; i < 3000; i++ {
+		b.WriteString(":7\r\n")
+	}
+	rep, err := readReply(bufio.NewReader(strings.NewReader(b.String())))
+	if err != nil || len(rep.Array) != 3000 || rep.Array[2999].Int != 7 {
+		t.Fatalf("long array: %v %d", err, len(rep.Array))
 	}
 }
 

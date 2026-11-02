@@ -309,11 +309,11 @@ type Overview struct {
 	P50Ms           float64   `json:"p50_ms"`
 	P95Ms           float64   `json:"p95_ms"`
 	P99Ms           float64   `json:"p99_ms"`
-	TopLimitedKeys  []Counted `json:"top_limited_keys"`  // by RateKey (Label = consumer name if known)
-	TopRoutes       []Counted `json:"top_routes"`        // by request count
-	TopPolicies     []Counted `json:"top_policies"`      // by limited count
-	TopConsumers    []Counted `json:"top_consumers"`     // by request count
-	StatusBreakdown []Counted `json:"status_breakdown"`  // ID = "2xx","3xx","4xx","429","5xx"
+	TopLimitedKeys  []Counted `json:"top_limited_keys"` // by RateKey (Label = consumer name if known)
+	TopRoutes       []Counted `json:"top_routes"`       // by request count
+	TopPolicies     []Counted `json:"top_policies"`     // by limited count
+	TopConsumers    []Counted `json:"top_consumers"`    // by request count
+	StatusBreakdown []Counted `json:"status_breakdown"` // ID = "2xx","3xx","4xx","429","5xx"
 	Since           time.Time `json:"since"`
 }
 

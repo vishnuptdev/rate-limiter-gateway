@@ -280,7 +280,7 @@ func (m *Memory) Allow(ctx context.Context, key string, p Params) (Decision, err
 				// of overflow buckets so the key is still limited.
 				return m.allowOverflow(sk, p, now), nil
 			}
-			m.keys.Add(1)
+			// Evicted one, inserting one: the count is unchanged.
 		}
 		s.m[sk] = e
 	}

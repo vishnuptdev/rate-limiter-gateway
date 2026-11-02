@@ -1,0 +1,19 @@
+# Caddy forward_auth calling RateGuard's /_rlg/v1/auth.
+# forward_auth sends X-Forwarded-Method and X-Forwarded-Uri (plus the usual
+# X-Forwarded-For/-Host from reverse_proxy). Add Caddy's address to RateGuard's
+# Settings -> Trusted proxies so the client IP is read from X-Forwarded-For.
+# Directive reference: https://caddyserver.com/docs/caddyfile/directives/forward_auth
+#
+# On 429 Caddy relays RateGuard's response to the client. copy_headers copies
+# the listed headers from the auth response onto the request sent upstream.
+#
+# The auth endpoint is unauthenticated by default: keep RateGuard reachable
+# only from Caddy's network, or enable Settings -> Forward auth require token.
+
+api.example.com {
+	forward_auth rateguard:8080 {
+		uri /_rlg/v1/auth
+		copy_headers X-RateGuard-Consumer RateLimit-Limit RateLimit-Remaining RateLimit-Reset RateLimit-Policy
+	}
+	reverse_proxy your-upstream:3000
+}

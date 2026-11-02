@@ -1,0 +1,61 @@
+# Envoy HTTP ext_authz filter calling RateGuard. Fragment: put the filter in
+# your HttpConnectionManager http_filters (before the router) and the cluster
+# under static_resources.clusters. Field reference:
+# https://www.envoyproxy.io/docs/envoy/latest/api-v3/extensions/filters/http/ext_authz/v3/ext_authz.proto
+#
+# Envoy's HTTP ext_authz sends the ORIGINAL method and path appended to
+# path_prefix (here /_rlg/v1/auth/<original path>?<query>); RateGuard accepts
+# that form, so no X-Forwarded-Uri header is needed. In this form the query
+# string belongs to the end client, so ?route_id= is ignored: routes are
+# matched by host/path/method.
+#
+# Add Envoy's address to RateGuard's Settings -> Trusted proxies and make sure
+# x-forwarded-for reaches RateGuard (allowed_headers below). Keep the endpoint
+# reachable only from Envoy's network (it is unauthenticated by default).
+
+http_filters:
+  - name: envoy.filters.http.ext_authz
+    typed_config:
+      "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthz
+      transport_api_version: V3
+      failure_mode_allow: true       # fail open if RateGuard is unreachable
+      http_service:
+        server_uri:
+          uri: http://rateguard:8080
+          cluster: rateguard
+          timeout: 0.25s
+        path_prefix: /_rlg/v1/auth
+        authorization_request:
+          allowed_headers:
+            patterns:
+              - exact: x-api-key
+              - exact: authorization
+              - exact: x-forwarded-for
+        authorization_response:
+          # Copied onto the request sent upstream.
+          allowed_upstream_headers:
+            patterns:
+              - exact: x-rateguard-consumer
+          # Copied onto the denied (429/401) response sent to the client.
+          allowed_client_headers:
+            patterns:
+              - exact: retry-after
+              - exact: ratelimit-limit
+              - exact: ratelimit-remaining
+              - exact: ratelimit-reset
+              - exact: ratelimit-policy
+  - name: envoy.filters.http.router
+    typed_config:
+      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+# static_resources.clusters entry:
+#   - name: rateguard
+#     type: STRICT_DNS
+#     connect_timeout: 0.25s
+#     load_assignment:
+#       cluster_name: rateguard
+#       endpoints:
+#         - lb_endpoints:
+#             - endpoint:
+#                 address:
+#                   socket_address: { address: rateguard, port_value: 8080 }

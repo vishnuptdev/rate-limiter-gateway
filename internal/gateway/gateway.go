@@ -247,6 +247,10 @@ func (g *Gateway) serveReserved(w http.ResponseWriter, r *http.Request, p string
 	case "/_rlg/v1/check":
 		g.serveCheck(w, r)
 	default:
+		if p == authPath || strings.HasPrefix(p, authPath+"/") {
+			g.serveAuth(w, r, p)
+			return
+		}
 		writeJSON(w, http.StatusNotFound, errBody("not_found", ""))
 	}
 }
@@ -386,14 +390,8 @@ func (g *Gateway) serveProxy(w http.ResponseWriter, r *http.Request, cleaned str
 	// BEFORE the engine is consulted: a rejection after Allow would already
 	// have advanced the bucket (phantom backlog charged to retrying clients).
 	if route.shaper != nil {
-		if g.shapeWaiters.Add(1) > g.maxShapeWaiters {
-			g.shapeWaiters.Add(-1)
-			prm, _ := ri.effective(route.shaper, 1)
-			res := &polResult{cp: route.shaper, params: prm, composite: ri.composite(route.shaper),
-				dec: ratelimit.Decision{Limit: prm.Burst, ResetAfter: time.Second, RetryAfter: time.Second}}
-			if res.dec.Limit == 0 {
-				res.dec.Limit = prm.Limit
-			}
+		res, ok := g.reserveShaper(ri, route)
+		if !ok {
 			le.PolicyID, le.RateKey, le.Limit = route.shaper.p.ID, res.composite, res.dec.Limit
 			le.Decision, le.Error = model.DecisionLimited, "shaping_queue_full"
 			g.writeLimited(w, cfg, res, start)
@@ -458,17 +456,13 @@ func (g *Gateway) serveProxy(w http.ResponseWriter, r *http.Request, cleaned str
 		g.shapeWaiters.Add(-1)
 	}
 	if wait > 0 {
-		timer := time.NewTimer(wait)
-		select {
-		case <-timer.C:
-			reserved = false
-			g.shapeWaiters.Add(-1)
-		case <-r.Context().Done():
-			timer.Stop()
+		if !waitShaping(r.Context(), wait) {
 			le.Decision, le.Error = model.DecisionError, "client_closed"
 			w.WriteHeader(499) // nginx convention: client closed request
 			return
 		}
+		reserved = false
+		g.shapeWaiters.Add(-1)
 	}
 
 	st = &reqState{consumerID: le.ConsumerID, clientIP: ip, started: g.now()}
@@ -498,6 +492,36 @@ func (g *Gateway) serveProxy(w http.ResponseWriter, r *http.Request, cleaned str
 		u.Path = p
 	}
 	route.proxy.ServeHTTP(w, r2)
+}
+
+// reserveShaper takes one global shaping-waiter slot for a route with an
+// enforcing leaky bucket. When the queue cap is reached it returns false and a
+// synthetic limited result for the 429; on success the caller owns the slot
+// and must give it back (shapeWaiters.Add(-1)).
+func (g *Gateway) reserveShaper(ri *reqInfo, route *croute) (*polResult, bool) {
+	if g.shapeWaiters.Add(1) <= g.maxShapeWaiters {
+		return nil, true
+	}
+	g.shapeWaiters.Add(-1)
+	prm, _ := ri.effective(route.shaper, 1)
+	res := &polResult{cp: route.shaper, params: prm, composite: ri.composite(route.shaper),
+		dec: ratelimit.Decision{Limit: prm.Burst, ResetAfter: time.Second, RetryAfter: time.Second}}
+	if res.dec.Limit == 0 {
+		res.dec.Limit = prm.Limit
+	}
+	return res, false
+}
+
+// waitShaping sleeps for d, reporting false if ctx ends first.
+func waitShaping(ctx context.Context, d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }
 
 // record applies sampling: only allowed, non-error requests are sampled.

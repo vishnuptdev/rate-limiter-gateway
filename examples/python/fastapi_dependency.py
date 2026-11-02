@@ -27,6 +27,7 @@ body as "api_key". Behind a load balancer, make sure the proxy address is in
 RateGuard's trusted proxies, or pass the real client IP through.
 """
 
+import asyncio
 import logging
 import os
 from typing import Any
@@ -87,3 +88,8 @@ async def rate_limit(request: Request, response: Response) -> None:
 
     for name, value in headers.items():
         response.headers[name] = value
+
+    # Leaky-bucket shaping: hold the request for delay_ms before the handler.
+    delay_ms = decision.get("delay_ms") or 0
+    if delay_ms > 0:
+        await asyncio.sleep(delay_ms / 1000)

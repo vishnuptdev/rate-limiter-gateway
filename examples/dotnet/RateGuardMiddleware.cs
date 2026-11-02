@@ -84,6 +84,9 @@ public class RateGuardMiddleware
                 await ctx.Response.WriteAsJsonAsync(new { error = kind == "limited" ? "rate_limited" : kind });
                 return;
             }
+            // Leaky-bucket shaping: hold the request for delay_ms.
+            if (d.TryGetProperty("delay_ms", out var dm) && dm.TryGetInt64(out var delayMs) && delayMs > 0)
+                await Task.Delay(TimeSpan.FromMilliseconds(delayMs), ctx.RequestAborted);
         }
         await _next(ctx);
     }

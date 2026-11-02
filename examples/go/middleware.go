@@ -15,6 +15,8 @@
 // Behaviour:
 //   - Allowed: decision headers (RateLimit-*) are set and the handler runs.
 //   - Denied: 429 with Retry-After and the decision details.
+//   - Shaping: when a leaky_bucket policy answers with delay_ms > 0, the
+//     request is held that long before the handler runs.
 //   - Fail-open: if RateGuard errors or does not answer within Timeout (50 ms
 //     by default), the request continues and a warning is logged.
 package rateguardmw
@@ -82,6 +84,7 @@ type checkResponse struct {
 	Remaining   int               `json:"remaining"`
 	ResetS      int               `json:"reset_s"`
 	RetryAfterS int               `json:"retry_after_s"`
+	DelayMs     int64             `json:"delay_ms"`
 	Headers     map[string]string `json:"headers"`
 }
 
@@ -153,6 +156,15 @@ func (m *Middleware) Wrap(next http.Handler) http.Handler {
 			return
 		}
 
+		if d.DelayMs > 0 { // leaky-bucket shaping: hold the request
+			t := time.NewTimer(time.Duration(d.DelayMs) * time.Millisecond)
+			select {
+			case <-t.C:
+			case <-r.Context().Done():
+				t.Stop()
+				return
+			}
+		}
 		next.ServeHTTP(w, r)
 	})
 }

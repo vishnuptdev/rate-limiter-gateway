@@ -59,6 +59,10 @@ final class RateGuardMiddleware implements MiddlewareInterface
             $response = $this->responses->createResponse($status)->withHeader('Content-Type', 'application/json');
             $response->getBody()->write(json_encode(['error' => $kind === 'limited' ? 'rate_limited' : $kind]));
         } else {
+            $delayMs = (int) ($decision['delay_ms'] ?? 0);
+            if ($delayMs > 0) {
+                usleep($delayMs * 1000); // leaky-bucket shaping
+            }
             $response = $handler->handle($request);
         }
         foreach ($headers as $name => $value) {

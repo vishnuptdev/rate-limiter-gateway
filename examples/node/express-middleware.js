@@ -14,6 +14,8 @@
 // - Allowed: the decision headers (RateLimit-*) are set on the response and the
 //   request continues.
 // - Denied: responds 429 with Retry-After and the decision details.
+// - Shaping: when a leaky_bucket policy answers with delay_ms > 0, the request
+//   is held that long before it continues.
 // - Fail-open: if RateGuard errors or does not answer within 50 ms, the request
 //   continues. A bad token also fails open, so watch the warnings in your logs.
 //
@@ -81,6 +83,9 @@ function rateGuard(opts = {}) {
       return;
     }
 
+    if (decision.delay_ms > 0) {
+      await new Promise(resolve => setTimeout(resolve, decision.delay_ms));
+    }
     return next();
   };
 }

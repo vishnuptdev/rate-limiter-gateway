@@ -95,6 +95,15 @@ public class RateGuardFilter extends OncePerRequestFilter {
             res.getWriter().write("{\"error\":\"" + (status == 429 ? "rate_limited" : d) + "\"}");
             return;
         }
+        long delayMs = decision.path("delay_ms").asLong(0);
+        if (delayMs > 0) { // leaky-bucket shaping: hold the request
+            try {
+                Thread.sleep(delayMs);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+        }
         chain.doFilter(req, res);
     }
 }

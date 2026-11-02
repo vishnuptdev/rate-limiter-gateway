@@ -40,6 +40,8 @@ class RateGuard
 
     headers = decision['headers'] || {}
     unless decision['allowed'] == false
+      delay_ms = decision['delay_ms'].to_i
+      sleep(delay_ms / 1000.0) if delay_ms.positive? # leaky-bucket shaping
       status, resp_headers, body = @app.call(env)
       return [status, resp_headers.merge(headers), body]
     end

@@ -27,6 +27,7 @@ import (
 	"net/http"
 	"os"
 	"runtime"
+	"runtime/pprof"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -49,7 +50,17 @@ func main() {
 	redisAddr := flag.String("redis", "127.0.0.1:6379", "redis address (engine=redis)")
 	sample := flag.Float64("sample", 1, "log_sample_allowed (fraction of allowed requests logged)")
 	only := flag.String("only", "", "run a single scenario: direct, proxy or auth")
+	cpuProf := flag.String("cpuprofile", "", "write a CPU profile of the whole process (load generator included) to this file")
 	flag.Parse()
+	if *cpuProf != "" {
+		f, err := os.Create(*cpuProf)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		pprof.StartCPUProfile(f)
+		defer pprof.StopCPUProfile()
+	}
 
 	fmt.Printf("rateguard-bench: GOMAXPROCS=%d NumCPU=%d %s/%s %s engine=%s clients=%d duration=%s sample=%g\n",
 		runtime.GOMAXPROCS(0), runtime.NumCPU(), runtime.GOOS, runtime.GOARCH, runtime.Version(), *engineName, *conc, *dur, *sample)

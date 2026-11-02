@@ -95,3 +95,14 @@ Dirs: `internal/gateway/`, `internal/ratelimit/`, `internal/telemetry/`, `intern
   memory engine: avoid time.Now per call where safe (coarse clock with ≤1ms resolution, option), shard by maphash.
 - Target and report: memory engine Allow < 100ns/op parallel; gateway overhead (excluding upstream) p50 < 50µs; 0-2 allocs on engine path.
 - Write docs/PERFORMANCE.md with real numbers from this machine (before/after table) and tuning guide.
+
+### Task 10: Open-source launch polish (stars + resume)
+Runs last, after Tasks 4/5/7/8/9 merged. Files: LICENSE (MIT, "Copyright (c) 2026 vishnuptdev"), README.md, CONTRIBUTING.md,
+CODE_OF_CONDUCT.md (Contributor Covenant 2.1), CHANGELOG.md (v1.0.0), .github/workflows/ci.yml (go 1.24: gofmt check, vet, test -race with redis service,
+build; docker build), .github/workflows/release.yml (on tag v*: cross-compile linux/darwin/windows amd64+arm64 tarballs with checksums,
+push multi-arch image to ghcr.io/vishnuptdev/rateguard), .github/ISSUE_TEMPLATE/{bug_report,feature_request}.yml, .github/pull_request_template.md,
+.github/dependabot.yml (github-actions + docker), docs/screenshots/*.png (real Playwright screenshots of the dashboard in demo mode, light+dark).
+README: hero line + badges (CI, Go Report Card, license, Go version, release), screenshot, "Why RateGuard" bullets, 60-second quickstart
+(docker run + binary + `RLG_DEMO=true`), feature list, 7-algorithm table, integration modes, real benchmark numbers from docs/PERFORMANCE.md,
+architecture diagram, config reference (all env vars with defaults), FAQ, roadmap, contributing, license. Honest claims only (no fake numbers, no
+false comparisons with other products).

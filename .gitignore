@@ -1,4 +1,11 @@
 /bin/
+# make build / make run / make demo outputs (data dirs hold password hashes
+# and plaintext demo keys)
+/rateguard
+/rateguard.exe
+/rateguard-bench
+/data/
+/data-demo/
 *.test
 *.out
 .env

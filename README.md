@@ -6,7 +6,7 @@
 
 [![CI](https://github.com/vishnuptdev/rate-limiter-gateway/actions/workflows/ci.yml/badge.svg)](https://github.com/vishnuptdev/rate-limiter-gateway/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Go 1.24](https://img.shields.io/badge/go-1.24-00ADD8.svg?logo=go&logoColor=white)](go.mod)
+[![Go 1.24.7+](https://img.shields.io/badge/go-1.24.7%2B-00ADD8.svg?logo=go&logoColor=white)](go.mod)
 [![Zero dependencies](https://img.shields.io/badge/dependencies-zero-brightgreen.svg)](go.mod)
 
 <img src="docs/screenshots/overview-dark.png" alt="RateGuard dashboard overview in dark mode" width="900">
@@ -37,7 +37,7 @@ docker run --rm --name rateguard -p 8080:8080 -p 9000:9000 \
   rateguard
 ```
 
-**Binary from source** (Go 1.24+):
+**Binary from source** (Go 1.24.7+):
 
 ```bash
 make build

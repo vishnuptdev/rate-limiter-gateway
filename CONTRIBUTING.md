@@ -11,7 +11,7 @@ welcome. By taking part you agree to follow the [Code of Conduct](CODE_OF_CONDUC
 
 ## Development setup
 
-You need Go 1.24 or newer. Redis 7 is optional (only the Redis tests need it).
+You need Go 1.24.7 or newer (the `go.mod` floor). Redis 7 is optional (only the Redis tests need it).
 
 ```bash
 git clone https://github.com/vishnuptdev/rate-limiter-gateway.git

@@ -261,7 +261,7 @@ func compilePolicy(p *model.Policy, c *compiled) *cpolicy {
 	for _, k := range p.KeyBy {
 		switch {
 		case k == "consumer":
-			cp.parts = append(cp.parts, keyPart{kind: partConsumer})
+			cp.parts = append(cp.parts, keyPart{kind: partConsumer, bits: c.ipv6Bits}) // anonymous fallback is a masked IP
 		case k == "api_key":
 			cp.parts = append(cp.parts, keyPart{kind: partAPIKey})
 		case k == "ip":

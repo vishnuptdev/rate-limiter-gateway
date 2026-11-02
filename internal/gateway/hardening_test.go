@@ -108,6 +108,34 @@ func TestHardenIPv6PrefixKey(t *testing.T) {
 	}
 }
 
+// SA2: the anonymous fallback of a "consumer" key part ("ip:<addr>") masks
+// IPv6 clients the same way as the "ip" part.
+func TestHardenIPv6PrefixConsumerFallback(t *testing.T) {
+	up := upstream(t, "u")
+	e := newEnv(t, func(s *model.Snapshot) {
+		s.Policies = []model.Policy{pol("pc", model.AlgoFixedWindow, 1, "consumer")}
+		s.Routes = []model.Route{route("r", up.URL, "/", "pc")}
+	})
+	n := 0
+	for i := 1; i <= 10; i++ {
+		if e.do("GET", "/x", remote(fmt.Sprintf("[2001:db8:1:2::%x]:1", i))).Code == http.StatusOK {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Fatalf("%d anonymous requests allowed from one /64 (limit 1)", n)
+	}
+	if k := e.rec.last(t).RateKey; k != "ip:2001:db8:1:2::/64" {
+		t.Fatalf("rate key %q", k)
+	}
+	if e.do("GET", "/x", remote("198.51.100.1:1")).Code != http.StatusOK {
+		t.Fatal("IPv4 client limited")
+	}
+	if k := e.rec.last(t).RateKey; k != "ip:198.51.100.1" {
+		t.Fatalf("IPv4 rate key %q", k)
+	}
+}
+
 // SA3: the dashboard session cookie never reaches upstreams through the
 // data plane (browsers send it to every port of the same host).
 func TestHardenAdminSessionCookieNotForwarded(t *testing.T) {
@@ -356,6 +384,36 @@ func TestHardenClientIPHeaders(t *testing.T) {
 	ec = decodeEcho(t, e.do("GET", "/a", append(spoof, remote("10.0.0.5:1"), hdr("X-Forwarded-For", "203.0.113.7"))...))
 	if ec.Headers["X-Real-Ip"] != "203.0.113.7" || ec.Headers["Forwarded"] != "" || ec.Headers["X-Forwarded-For"] != "203.0.113.7, 10.0.0.5" {
 		t.Fatalf("trusted peer: X-Real-Ip=%q Forwarded=%q XFF=%q", ec.Headers["X-Real-Ip"], ec.Headers["Forwarded"], ec.Headers["X-Forwarded-For"])
+	}
+}
+
+// SA6: underscore spellings of the client-IP headers (which CGI-style
+// servers read as HTTP_X_REAL_IP etc.) never reach the upstream.
+func TestHardenClientIPHeaderUnderscores(t *testing.T) {
+	up := upstream(t, "u")
+	e := newEnv(t, func(s *model.Snapshot) { s.Routes = []model.Route{route("x", up.URL, "/")} })
+	bad := []string{"X_Real_IP", "x_forwarded_for", "X-Forwarded_Host", "X_FORWARDED_PROTO"}
+	var opts []func(*http.Request)
+	for _, k := range bad {
+		k := k
+		opts = append(opts, func(r *http.Request) { r.Header[k] = []string{"7.7.7.7"} })
+	}
+	opts = append(opts, hdr("X_Custom_Thing", "keep"))
+	ec := decodeEcho(t, e.do("GET", "/a", opts...))
+	for k, v := range ec.Headers {
+		n := strings.ReplaceAll(strings.ToLower(k), "_", "-")
+		if strings.Contains(k, "_") && (n == "x-real-ip" || n == "x-forwarded-for" || n == "x-forwarded-host" || n == "x-forwarded-proto") {
+			t.Errorf("upstream saw %s: %s", k, v)
+		}
+		if v == "7.7.7.7" {
+			t.Errorf("spoofed value reached upstream in %s", k)
+		}
+	}
+	if ec.Headers["X-Real-Ip"] != "192.0.2.10" {
+		t.Fatalf("X-Real-Ip=%q", ec.Headers["X-Real-Ip"])
+	}
+	if ec.Headers["X_custom_thing"] != "keep" && ec.Headers["X_Custom_Thing"] != "keep" {
+		t.Fatalf("unrelated underscore header dropped: %v", ec.Headers)
 	}
 }
 

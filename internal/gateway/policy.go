@@ -104,7 +104,9 @@ func (ri *reqInfo) part(kp keyPart) string {
 		if ri.consumer != nil {
 			return ri.consumer.c.ID
 		}
-		return "ip:" + ri.ip
+		// Anonymous: fall back to the client IP, masked like the "ip" part
+		// so IPv6 clients cannot rotate addresses within their prefix.
+		return "ip:" + maskIP(ri.ip, kp.bits)
 	case partAPIKey:
 		if ri.apiKey == "" {
 			return "-"

@@ -790,8 +790,11 @@ func rewriteRequest(target *url.URL) func(*httputil.ProxyRequest) {
 		pr.SetURL(target)
 		out := pr.Out
 		// Spoof protection: never forward client-supplied X-RateGuard-*.
+		// Also drop underscore spellings of the client-IP headers
+		// (X_Real_IP, X_Forwarded_For, ...): CGI-style servers map them to
+		// the same HTTP_X_REAL_IP variable as the rewritten header.
 		for k := range out.Header {
-			if isRGHeader(k) {
+			if isRGHeader(k) || (strings.IndexByte(k, '_') >= 0 && clientIPHeaders[strings.ReplaceAll(strings.ToLower(k), "_", "-")]) {
 				delete(out.Header, k)
 			}
 		}
@@ -860,6 +863,12 @@ func stripCookie(h http.Header, name string) {
 		return
 	}
 	h["Cookie"] = out
+}
+
+// clientIPHeaders are the headers RateGuard rewrites (lower case); their
+// underscore spellings are stripped from requests.
+var clientIPHeaders = map[string]bool{
+	"x-forwarded-for": true, "x-forwarded-host": true, "x-forwarded-proto": true, "x-real-ip": true, "forwarded": true,
 }
 
 // trailerDenied lists request trailer names (lower case, "_" read as "-")

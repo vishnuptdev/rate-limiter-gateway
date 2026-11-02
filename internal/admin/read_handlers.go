@@ -49,7 +49,9 @@ func (s *Server) handleSystem(w http.ResponseWriter, r *http.Request, _ *princip
 		engine["name"] = s.o.Engine.Name()
 		engine["healthy"] = err == nil
 		if err != nil {
-			engine["error"] = err.Error()
+			// Raw backend errors (addresses, auth failures) stay in the log.
+			engine["error"] = "unhealthy"
+			s.log.Warn("engine health check failed", "err", err)
 		}
 	}
 	now := s.now()
@@ -190,6 +192,15 @@ func (s *Server) handleLogStream(w http.ResponseWriter, r *http.Request, p *prin
 		writeErr(w, &apiError{Status: http.StatusServiceUnavailable, Code: "too_many_streams", Message: "too many live log streams"})
 		return
 	}
+	pid := p.kind + ":" + p.name
+	if p.kind == "token" {
+		pid = "token:" + p.tokenID
+	}
+	if !s.acquireStream(pid) {
+		writeErr(w, &apiError{Status: http.StatusTooManyRequests, Code: "too_many_streams", Message: "too many live log streams for this user"})
+		return
+	}
+	defer s.releaseStream(pid)
 	rc := http.NewResponseController(w)
 	ch, cancel := s.o.Telemetry.Subscribe(256)
 	defer cancel()
@@ -243,6 +254,24 @@ func (s *Server) handleLogStream(w http.ResponseWriter, r *http.Request, p *prin
 				return
 			}
 		}
+	}
+}
+
+func (s *Server) acquireStream(pid string) bool {
+	s.sseMu.Lock()
+	defer s.sseMu.Unlock()
+	if s.sseByID[pid] >= maxSSEStreamsPerPrincipal {
+		return false
+	}
+	s.sseByID[pid]++
+	return true
+}
+
+func (s *Server) releaseStream(pid string) {
+	s.sseMu.Lock()
+	defer s.sseMu.Unlock()
+	if s.sseByID[pid]--; s.sseByID[pid] <= 0 {
+		delete(s.sseByID, pid)
 	}
 }
 

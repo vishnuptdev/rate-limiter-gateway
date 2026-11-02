@@ -242,8 +242,9 @@ func TestConsumerKeys(t *testing.T) {
 		t.Fatalf("key format %q", out.Key)
 	}
 	sum := sha256.Sum256([]byte(out.Key))
-	if out.APIKey.Hash != hex.EncodeToString(sum[:]) || out.APIKey.Prefix != out.Key[:12] {
-		t.Fatalf("hash/prefix: %+v", out.APIKey)
+	stored := e.rt.Current().Consumers[0].Keys[1]
+	if stored.ID != out.APIKey.ID || stored.Hash != hex.EncodeToString(sum[:]) || out.APIKey.Hash != "" || out.APIKey.Prefix != out.Key[:12] {
+		t.Fatalf("hash/prefix: stored %+v response %+v", stored, out.APIKey)
 	}
 	// Stored config has the hash only; plaintext appears nowhere afterwards.
 	saved, _ := json.Marshal(e.store.saved)
@@ -254,7 +255,7 @@ func TestConsumerKeys(t *testing.T) {
 			t.Fatalf("plaintext key leaked via %s", name)
 		}
 	}
-	if !strings.Contains(string(saved), out.APIKey.Hash) {
+	if !strings.Contains(string(saved), stored.Hash) {
 		t.Fatal("hash not stored")
 	}
 	// No body is fine too.
@@ -350,7 +351,7 @@ func TestImport(t *testing.T) {
 	ver := e.rt.Current().Version
 	rec := e.req("POST", "/api/config/import", map[string]any{"snapshot": in, "dry_run": true}, c)
 	out := decode[map[string]any](t, rec)
-	if rec.Code != 200 || out["ok"] != true || out["validated"] != true {
+	if rec.Code != 200 || out["ok"] != true {
 		t.Fatalf("dry run: %d %s", rec.Code, rec.Body)
 	}
 	diff := out["diff"].(map[string]any)
@@ -399,13 +400,61 @@ func TestImport(t *testing.T) {
 	}
 }
 
-func TestImportWithoutValidator(t *testing.T) {
+func TestDefaultValidatorIsStoreValidate(t *testing.T) {
+	e := newEnv(t) // Options.Validate left nil
+	c := e.login("admin", adminPW)
+	bad := seedSnapshot()
+	bad.Policies[0].Algorithm = "nope"
+	rec := e.req("POST", "/api/config/import", map[string]any{"snapshot": bad, "dry_run": true}, c)
+	out := decode[map[string]any](t, rec)
+	if out["ok"] != false || !strings.Contains(rec.Body.String(), "policies[0].algorithm") {
+		t.Fatalf("store.Validate not applied by default: %s", rec.Body)
+	}
+	rec = e.req("POST", "/api/policies", map[string]any{"name": "Bad", "algorithm": "fixed_window", "limit": 0, "window": "1s"}, c)
+	if rec.Code != 422 || !strings.Contains(rec.Body.String(), `"field":"policies[2].limit"`) {
+		t.Fatalf("422 problems via store.ValidationError.ProblemsJSON: %d %s", rec.Code, rec.Body)
+	}
+	if rec := e.req("POST", "/api/config/import", map[string]any{"snapshot": seedSnapshot(), "dry_run": true}, c); decode[map[string]any](t, rec)["ok"] != true {
+		t.Fatalf("seed invalid under store.Validate: %s", rec.Body)
+	}
+}
+
+func TestKeyHashesRedacted(t *testing.T) {
 	e := newEnv(t)
 	c := e.login("admin", adminPW)
-	rec := e.req("POST", "/api/config/import", map[string]any{"snapshot": seedSnapshot(), "dry_run": true}, c)
-	if out := decode[map[string]any](t, rec); out["validated"] != false || out["ok"] != true {
-		t.Fatalf("%s", rec.Body)
+	tok := e.token("root", ScopeAdmin)
+	hash := strings.Repeat("a", 64) // seed key k1
+	for _, rec := range []*httptest.ResponseRecorder{
+		e.req("GET", "/api/consumers", nil, c),
+		e.req("GET", "/api/consumers/c1", nil, c),
+		e.req("GET", "/api/consumers/c1", nil, cred{bearer: tok}),
+		e.req("PUT", "/api/consumers/c1", map[string]any{"name": "Acme", "plan_id": "pl1"}, c),
+		e.req("POST", "/api/consumers/c1/keys", nil, c),
+		e.req("DELETE", "/api/consumers/c1/keys/k1", nil, c),
+	} {
+		if rec.Code >= 300 || strings.Contains(rec.Body.String(), hash) || regexp.MustCompile(`"hash":"[0-9a-f]+`).MatchString(rec.Body.String()) {
+			t.Fatalf("hash exposed or failed: %d %s", rec.Code, rec.Body)
+		}
 	}
+	// Redaction is response-only: stored config and admin export keep hashes.
+	if e.rt.Current().Consumers[0].Keys[0].Hash != hash || !strings.Contains(e.req("GET", "/api/config/export", nil, c).Body.String(), hash) {
+		t.Fatal("hash lost from stored config / export")
+	}
+}
+
+func TestSystemHidesEngineError(t *testing.T) {
+	e := newEnv(t, func(o *Options) { o.Engine = &sickEngine{} })
+	rec := e.req("GET", "/api/system", nil, e.login("admin", adminPW))
+	eng := decode[map[string]any](t, rec)["engine"].(map[string]any)
+	if eng["healthy"] != false || eng["error"] != "unhealthy" || strings.Contains(rec.Body.String(), "10.9.9.9") {
+		t.Fatalf("engine: %s", rec.Body)
+	}
+}
+
+type sickEngine struct{ fakeEngine }
+
+func (*sickEngine) Healthy(context.Context) error {
+	return errors.New("dial tcp 10.9.9.9:6379: NOAUTH secret-ish detail")
 }
 
 func TestAuditLog(t *testing.T) {
@@ -862,5 +911,59 @@ func TestMatchesFilter(t *testing.T) {
 		if matches(c.q, e) != c.want {
 			t.Errorf("case %d: %+v", i, c.q)
 		}
+	}
+}
+
+func TestLogStreamPerPrincipalCap(t *testing.T) {
+	e := newEnv(t)
+	srv := httptest.NewServer(e.h)
+	defer srv.Close()
+	c := e.login("admin", adminPW)
+	open := func(cookie, bearer string) *http.Response {
+		req, _ := http.NewRequest("GET", srv.URL+"/api/logs/stream", nil)
+		if cookie != "" {
+			req.AddCookie(&http.Cookie{Name: sessionCookie, Value: cookie})
+		}
+		if bearer != "" {
+			req.Header.Set("Authorization", "Bearer "+bearer)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp
+	}
+	var held []*http.Response
+	defer func() {
+		for _, r := range held {
+			r.Body.Close()
+		}
+	}()
+	for i := range maxSSEStreamsPerPrincipal {
+		r := open(c.cookie, "")
+		held = append(held, r)
+		if r.StatusCode != 200 {
+			t.Fatalf("stream %d: %d", i, r.StatusCode)
+		}
+	}
+	// Another session of the same user counts toward the same cap.
+	if r := open(e.login("admin", adminPW).cookie, ""); r.StatusCode != 429 {
+		r.Body.Close()
+		t.Fatalf("5th stream: %d", r.StatusCode)
+	}
+	// A different principal is unaffected.
+	r := open("", e.token("ro", ScopeRead))
+	held = append(held, r)
+	if r.StatusCode != 200 {
+		t.Fatalf("other principal: %d", r.StatusCode)
+	}
+	// Closing a stream frees a slot.
+	held[0].Body.Close()
+	held = held[1:]
+	waitFor(t, func() bool { return e.tel.subscribers() == maxSSEStreamsPerPrincipal })
+	r = open(c.cookie, "")
+	held = append(held, r)
+	if r.StatusCode != 200 {
+		t.Fatalf("after close: %d", r.StatusCode)
 	}
 }

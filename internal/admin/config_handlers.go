@@ -25,6 +25,8 @@ type kind[T any] struct {
 	setID            func(*T, string)
 	stamp            func(t *T, created, updated time.Time)
 	created          func(*T) time.Time
+	// redact (optional) strips fields no API reader needs from responses.
+	redact func(T) T
 	// prepare normalises a client-supplied object; old is nil on create.
 	prepare func(nu *T, old *T)
 	// referrers lists objects that would dangle if id were deleted.
@@ -126,6 +128,39 @@ var consumerKind = kind[model.Consumer]{
 		}
 	},
 	referrers: func(*model.Snapshot, string) []ref { return nil },
+	redact:    redactConsumer,
+}
+
+// redactKey drops the stored SHA-256: no API reader (any role) needs it, and
+// keeping it server-side denies offline verification of leaked keys. Full
+// hashes remain available only via the admin config export (backup/restore).
+func redactKey(k model.APIKey) model.APIKey {
+	k.Hash = ""
+	return k
+}
+
+func redactConsumer(c model.Consumer) model.Consumer {
+	keys := make([]model.APIKey, len(c.Keys))
+	for i, k := range c.Keys {
+		keys[i] = redactKey(k)
+	}
+	c.Keys = keys
+	return c
+}
+
+func (k kind[T]) out(v T) T {
+	if k.redact != nil {
+		return k.redact(v)
+	}
+	return v
+}
+
+func (k kind[T]) outList(vs []T) []T {
+	out := make([]T, len(vs))
+	for i, v := range vs {
+		out[i] = k.out(v)
+	}
+	return out
 }
 
 func find[T any](k kind[T], s *model.Snapshot, id string) int {
@@ -141,7 +176,7 @@ func find[T any](k kind[T], s *model.Snapshot, id string) int {
 func registerCRUD[T any](s *Server, mux *http.ServeMux, k kind[T]) {
 	base := "/api/" + k.plural
 	mux.Handle("GET "+base, s.guard(levelViewer, func(w http.ResponseWriter, r *http.Request, _ *principal) {
-		writeJSON(w, http.StatusOK, *k.items(s.mgr.current()))
+		writeJSON(w, http.StatusOK, k.outList(*k.items(s.mgr.current())))
 	}))
 	mux.Handle("GET "+base+"/{id}", s.guard(levelViewer, func(w http.ResponseWriter, r *http.Request, _ *principal) {
 		snap := s.mgr.current()
@@ -150,7 +185,7 @@ func registerCRUD[T any](s *Server, mux *http.ServeMux, k kind[T]) {
 			writeErr(w, notFound(k.singular))
 			return
 		}
-		writeJSON(w, http.StatusOK, (*k.items(snap))[i])
+		writeJSON(w, http.StatusOK, k.out((*k.items(snap))[i]))
 	}))
 	mux.Handle("POST "+base, s.guard(levelEditor, func(w http.ResponseWriter, r *http.Request, p *principal) {
 		var obj T
@@ -184,7 +219,7 @@ func registerCRUD[T any](s *Server, mux *http.ServeMux, k kind[T]) {
 			return
 		}
 		s.record(r, p, k.singular+".create", k.singular, k.id(&created), "created "+k.singular+" "+quote(k.name(&created)))
-		writeJSON(w, http.StatusCreated, created)
+		writeJSON(w, http.StatusCreated, k.out(created))
 	}))
 	mux.Handle("PUT "+base+"/{id}", s.guard(levelEditor, func(w http.ResponseWriter, r *http.Request, p *principal) {
 		id := r.PathValue("id")
@@ -217,7 +252,7 @@ func registerCRUD[T any](s *Server, mux *http.ServeMux, k kind[T]) {
 			return
 		}
 		s.record(r, p, k.singular+".update", k.singular, id, "updated "+k.singular+" "+quote(k.name(&updated)))
-		writeJSON(w, http.StatusOK, updated)
+		writeJSON(w, http.StatusOK, k.out(updated))
 	}))
 	mux.Handle("DELETE "+base+"/{id}", s.guard(levelEditor, func(w http.ResponseWriter, r *http.Request, p *principal) {
 		id := r.PathValue("id")
@@ -313,7 +348,7 @@ func (s *Server) handleCreateKey(w http.ResponseWriter, r *http.Request, p *prin
 	}
 	s.record(r, p, "consumer.key_create", "consumer", cid, "issued API key "+key.ID+" ("+key.Prefix+"…)")
 	// The plaintext is returned exactly once and never stored or logged.
-	writeJSON(w, http.StatusCreated, map[string]any{"key": plain, "api_key": key})
+	writeJSON(w, http.StatusCreated, map[string]any{"key": plain, "api_key": redactKey(key)})
 }
 
 func (s *Server) handleRevokeKey(w http.ResponseWriter, r *http.Request, p *principal) {
@@ -340,7 +375,7 @@ func (s *Server) handleRevokeKey(w http.ResponseWriter, r *http.Request, p *prin
 		return
 	}
 	s.record(r, p, "consumer.key_revoke", "consumer", cid, "revoked API key "+kid+" ("+key.Prefix+"…)")
-	writeJSON(w, http.StatusOK, map[string]any{"api_key": key})
+	writeJSON(w, http.StatusOK, map[string]any{"api_key": redactKey(key)})
 }
 
 // ---------------------------------------------------------------------
@@ -444,17 +479,15 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request, p *princip
 	cur := s.mgr.current()
 	diff := snapshotDiff(cur, in)
 	if req.DryRun {
-		resp := map[string]any{"ok": true, "dry_run": true, "diff": diff, "validated": s.o.Validate != nil}
-		if s.o.Validate != nil {
-			cand := in.Clone()
-			cand.Version = cur.Version + 1
-			if err := s.mgr.check(cand); err != nil {
-				ve := err.(*apiError)
-				resp["ok"] = false
-				resp["message"] = ve.Message
-				if ve.Problems != nil {
-					resp["problems"] = ve.Problems
-				}
+		resp := map[string]any{"ok": true, "dry_run": true, "diff": diff}
+		cand := in.Clone()
+		cand.Version = cur.Version + 1
+		if err := s.mgr.check(cand); err != nil {
+			ve := err.(*apiError)
+			resp["ok"] = false
+			resp["message"] = ve.Message
+			if ve.Problems != nil {
+				resp["problems"] = ve.Problems
 			}
 		}
 		writeJSON(w, http.StatusOK, resp)

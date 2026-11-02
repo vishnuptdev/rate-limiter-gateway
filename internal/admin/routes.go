@@ -88,12 +88,16 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request, _ *principa
 	}
 	ip := s.clientIP(r)
 	username := strings.TrimSpace(req.Username)
-	if d := s.lock.lockedFor(username, ip); d > 0 {
+	// Reserve the attempt atomically before the slow verification so
+	// parallel guesses cannot all slip past the lockout check.
+	att, d := s.lock.begin(username, ip)
+	if att == nil {
 		secs := int((d + time.Second - 1) / time.Second)
 		writeErr(w, &apiError{Status: http.StatusTooManyRequests, Code: "locked_out",
 			Message: "too many failed login attempts; try again later", Extra: map[string]any{"retry_after_s": secs}})
 		return
 	}
+	defer att.abort() // no-op once fail/succeed ran
 	u, known := s.auth.getUser(username)
 	hash := s.dummy
 	if known {
@@ -107,7 +111,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request, _ *principa
 		return
 	}
 	if !ok || !known {
-		s.lock.fail(username, ip)
+		att.fail()
 		// Audit both cases (same I/O on either path). The submitted name of
 		// an unknown user is never recorded: it is often a mistyped password.
 		if known {
@@ -118,7 +122,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request, _ *principa
 		writeErr(w, &apiError{Status: http.StatusUnauthorized, Code: "invalid_credentials", Message: "invalid username or password"})
 		return
 	}
-	s.lock.success(username)
+	att.succeed()
 	if err := s.auth.recordLogin(u.Username); err != nil {
 		s.log.Warn("recording last login failed", "err", err)
 	}
@@ -139,6 +143,9 @@ func (s *Server) verifyBounded(ctx context.Context, hash, pw string) (bool, erro
 		return false, ctx.Err()
 	}
 	defer func() { <-s.hashSem }()
+	if s.onVerify != nil {
+		s.onVerify()
+	}
 	return verifyPassword(hash, pw), nil
 }
 
@@ -192,24 +199,27 @@ func (s *Server) handlePassword(w http.ResponseWriter, r *http.Request, p *princ
 		writeErr(w, e)
 		return
 	}
-	ip := s.clientIP(r)
-	if d := s.lock.lockedFor(p.name, ip); d > 0 {
-		writeErr(w, &apiError{Status: http.StatusTooManyRequests, Code: "locked_out",
-			Message: "too many failed attempts; try again later", Extra: map[string]any{"retry_after_s": int((d + time.Second - 1) / time.Second)}})
-		return
-	}
 	u, ok := s.auth.getUser(p.name)
 	if !ok {
 		writeErr(w, errUnauthenticated)
 		return
 	}
+	// Session-authenticated, so limited per session (not per username: a
+	// stranger must not be able to lock a user out of changing their
+	// password). The budget is reserved before the slow verify.
+	if !s.sessions.beginPasswordCheck(p.sessionKey) {
+		s.clearSessionCookie(w, r)
+		writeErr(w, &apiError{Status: http.StatusUnauthorized, Code: "unauthorized", Message: "too many failed attempts; please sign in again"})
+		return
+	}
 	good, err := s.verifyBounded(r.Context(), u.PasswordHash, req.CurrentPassword)
+	s.sessions.finishPasswordCheck(p.sessionKey, err == nil && !good)
 	if err != nil {
 		writeErr(w, &apiError{Status: http.StatusServiceUnavailable, Code: "unavailable", Message: "request cancelled"})
 		return
 	}
 	if !good {
-		s.lock.fail(p.name, ip)
+		s.record(r, p, "auth.password_change_failed", "user", p.name, "wrong current password")
 		writeErr(w, &apiError{Status: http.StatusUnauthorized, Code: "invalid_credentials", Message: "current password is incorrect"})
 		return
 	}
@@ -235,10 +245,13 @@ func (s *Server) handlePassword(w http.ResponseWriter, r *http.Request, p *princ
 		writeErr(w, err)
 		return
 	}
-	s.lock.success(p.name)
-	s.sessions.deleteUser(p.name, p.sessionKey) // sign out every other session
+	// Sign out every session (including this one) and issue a fresh session
+	// ID and CSRF token for the caller.
+	s.sessions.deleteUser(p.name, "")
+	raw, sess := s.sessions.create(p.name)
+	s.setSessionCookie(w, r, raw)
 	s.record(r, p, "auth.password_change", "user", p.name, "changed own password")
-	w.WriteHeader(http.StatusNoContent)
+	writeJSON(w, http.StatusOK, map[string]any{"csrf_token": sess.csrf})
 }
 
 // ---------------------------------------------------------------------

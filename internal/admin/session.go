@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"net/netip"
 	"sort"
 	"strings"
 	"sync"
@@ -21,7 +22,15 @@ type session struct {
 	csrf     string
 	created  time.Time
 	lastSeen time.Time
+
+	pwFailures int // failed current-password checks on /api/auth/password
+	pwPending  int // in-flight current-password checks
 }
+
+// maxPasswordFailures is the per-session budget of wrong current passwords
+// on /api/auth/password; exhausting it destroys the session (the attacker
+// must then go through the login lockout again).
+const maxPasswordFailures = 5
 
 // sessionStore is an in-memory, bounded session table keyed by the SHA-256
 // of the session ID, so a memory dump or debug print never yields a usable
@@ -104,6 +113,37 @@ func (s *sessionStore) valid(key string) bool {
 	return ok && !s.expired(x, s.now())
 }
 
+// beginPasswordCheck reserves one current-password verification for the
+// session; false if the session is gone or its budget is used up.
+func (s *sessionStore) beginPasswordCheck(key string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	x, ok := s.m[key]
+	if !ok || x.pwFailures+x.pwPending >= maxPasswordFailures {
+		return false
+	}
+	x.pwPending++
+	return true
+}
+
+// finishPasswordCheck settles a reservation; on the last allowed failure the
+// session is destroyed.
+func (s *sessionStore) finishPasswordCheck(key string, failed bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	x, ok := s.m[key]
+	if !ok {
+		return
+	}
+	x.pwPending--
+	if failed {
+		x.pwFailures++
+		if x.pwFailures >= maxPasswordFailures {
+			delete(s.m, key)
+		}
+	}
+}
+
 func (s *sessionStore) delete(key string) {
 	s.mu.Lock()
 	delete(s.m, key)
@@ -155,14 +195,21 @@ const (
 
 type lockEntry struct {
 	failures    int
+	pending     int // attempts reserved but not yet finished (in-flight verifies)
 	lockedUntil time.Time
 	last        time.Time
 }
 
-// lockout tracks failed logins per username and per client IP. After 5
-// failures the key is locked for 30s, doubling per further failure up to
-// 15m. Unknown usernames are tracked exactly like known ones so lockout
-// behaviour does not reveal which accounts exist.
+// lockout tracks failed logins per username and per client IP (IPv6
+// bucketed by /64). After 5 failures the key is locked for 30s, doubling per
+// further failure up to 15m. Unknown usernames are tracked exactly like
+// known ones so lockout behaviour does not reveal which accounts exist.
+//
+// Attempts are reserved atomically BEFORE the slow password verification
+// (begin) and finalised after it (finish), so parallel requests cannot all
+// pass the check while earlier failures are still being verified: at most
+// threshold-failures attempts may be in flight below the threshold, and at
+// most one once a lock has expired.
 type lockout struct {
 	mu    sync.Mutex
 	users map[string]*lockEntry
@@ -182,72 +229,173 @@ func lockUserKey(u string) string {
 	return u
 }
 
-// lockedFor returns the remaining lock time (0 if not locked).
-func (l *lockout) lockedFor(username, ip string) time.Duration {
-	now := l.now()
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	var d time.Duration
-	for _, e := range []*lockEntry{l.users[lockUserKey(username)], l.ips[ip]} {
-		if e != nil && e.lockedUntil.After(now) {
-			d = max(d, e.lockedUntil.Sub(now))
-		}
+// lockIPKey buckets IPv6 addresses by /64 (one subscriber allocation) so an
+// attacker cannot rotate through their prefix to evade the per-IP limit.
+func lockIPKey(ip string) string {
+	addr, err := netip.ParseAddr(ip)
+	if err != nil {
+		return ip
 	}
-	return d
+	addr = addr.Unmap()
+	if addr.Is4() {
+		return addr.String()
+	}
+	p, err := addr.Prefix(64)
+	if err != nil {
+		return addr.String()
+	}
+	return p.String()
 }
 
-func (l *lockout) fail(username, ip string) {
-	now := l.now()
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	l.failLocked(l.users, lockUserKey(username), now)
-	l.failLocked(l.ips, ip, now)
-}
-
-func (l *lockout) failLocked(m map[string]*lockEntry, key string, now time.Time) {
-	e := m[key]
+// waitLocked returns how long e blocks a new attempt (0 = may proceed).
+func (l *lockout) waitLocked(e *lockEntry, now time.Time) time.Duration {
 	if e == nil {
-		if len(m) >= lockoutMaxKeys {
-			l.evict(m, now)
-		}
-		e = &lockEntry{}
-		m[key] = e
-	} else if !e.lockedUntil.After(now) && now.Sub(e.last) > lockoutForget {
-		*e = lockEntry{}
+		return 0
 	}
-	e.failures++
-	e.last = now
-	if e.failures >= lockoutThreshold {
-		d := lockoutMax
-		if shift := e.failures - lockoutThreshold; shift < 10 {
-			d = min(lockoutBase<<shift, lockoutMax)
-		}
-		e.lockedUntil = now.Add(d)
+	if e.lockedUntil.After(now) {
+		return e.lockedUntil.Sub(now)
 	}
+	if e.failures < lockoutThreshold {
+		if e.failures+e.pending >= lockoutThreshold {
+			return lockoutBase // budget fully reserved by in-flight attempts
+		}
+		return 0
+	}
+	if e.pending > 0 { // lock expired: one probe at a time
+		return lockoutBase
+	}
+	return 0
 }
 
-// evict removes forgettable entries, or else the least recently failed one.
-func (l *lockout) evict(m map[string]*lockEntry, now time.Time) {
+// forgettable reports whether e carries no live state.
+func forgettable(e *lockEntry, now time.Time) bool {
+	return e.pending == 0 && !e.lockedUntil.After(now) && now.Sub(e.last) > lockoutForget
+}
+
+// entryLocked returns (creating if needed) the entry for key; nil means the
+// table is full of live entries and the attempt must be refused.
+func (l *lockout) entryLocked(m map[string]*lockEntry, key string, now time.Time) *lockEntry {
+	e := m[key]
+	if e != nil {
+		if forgettable(e, now) {
+			*e = lockEntry{}
+		}
+		return e
+	}
+	if len(m) >= lockoutMaxKeys && !l.evict(m, now) {
+		return nil
+	}
+	e = &lockEntry{last: now}
+	m[key] = e
+	return e
+}
+
+// evict frees space: forgettable entries first, else the least recently
+// failed entry that is neither locked nor in flight. Never evicts a locked
+// entry; returns false if nothing could be evicted.
+func (l *lockout) evict(m map[string]*lockEntry, now time.Time) bool {
 	var oldestK string
 	var oldest *lockEntry
+	freed := false
 	for k, e := range m {
-		if !e.lockedUntil.After(now) && now.Sub(e.last) > lockoutForget {
+		if forgettable(e, now) {
 			delete(m, k)
+			freed = true
+			continue
+		}
+		if e.pending > 0 || e.lockedUntil.After(now) {
 			continue
 		}
 		if oldest == nil || e.last.Before(oldest.last) {
 			oldest, oldestK = e, k
 		}
 	}
-	if len(m) >= lockoutMaxKeys && oldest != nil {
+	if freed {
+		return true
+	}
+	if oldest != nil {
 		delete(m, oldestK)
+		return true
+	}
+	return false
+}
+
+// attempt is a reserved login attempt; exactly one of fail/succeed must be
+// called (extra calls are no-ops).
+type attempt struct {
+	l        *lockout
+	ue, ie   *lockEntry
+	finished bool
+}
+
+// begin reserves an attempt for (username, ip). If blocked it returns the
+// remaining wait and a nil attempt.
+func (l *lockout) begin(username, ip string) (*attempt, time.Duration) {
+	now := l.now()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	uk, ik := lockUserKey(username), lockIPKey(ip)
+	if d := max(l.waitLocked(l.users[uk], now), l.waitLocked(l.ips[ik], now)); d > 0 {
+		return nil, d
+	}
+	ue := l.entryLocked(l.users, uk, now)
+	ie := l.entryLocked(l.ips, ik, now)
+	if ue == nil || ie == nil {
+		return nil, lockoutBase // table saturated by live entries: fail closed
+	}
+	ue.pending++
+	ie.pending++
+	return &attempt{l: l, ue: ue, ie: ie}, 0
+}
+
+func (a *attempt) fail() {
+	l := a.l
+	now := l.now()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if a.finished {
+		return
+	}
+	a.finished = true
+	for _, e := range []*lockEntry{a.ue, a.ie} {
+		e.pending--
+		e.failures++
+		e.last = now
+		if e.failures >= lockoutThreshold {
+			d := lockoutMax
+			if shift := e.failures - lockoutThreshold; shift < 10 {
+				d = min(lockoutBase<<shift, lockoutMax)
+			}
+			e.lockedUntil = now.Add(d)
+		}
 	}
 }
 
-// success clears the username's failure record. The IP record is kept so a
-// valid account cannot be used to reset an IP that is guessing others.
-func (l *lockout) success(username string) {
+// succeed clears the username's failures. The IP record keeps its failures
+// so a valid account cannot be used to reset an IP that is guessing others.
+func (a *attempt) succeed() {
+	l := a.l
 	l.mu.Lock()
-	delete(l.users, lockUserKey(username))
-	l.mu.Unlock()
+	defer l.mu.Unlock()
+	if a.finished {
+		return
+	}
+	a.finished = true
+	a.ie.pending--
+	a.ue.pending--
+	a.ue.failures = 0
+	a.ue.lockedUntil = time.Time{}
+}
+
+// abort releases the reservation without counting it (e.g. request cancelled).
+func (a *attempt) abort() {
+	l := a.l
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if a.finished {
+		return
+	}
+	a.finished = true
+	a.ue.pending--
+	a.ie.pending--
 }

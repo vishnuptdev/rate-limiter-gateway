@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -108,11 +110,28 @@ func TestBootstrapRandomPasswordAndMustChange(t *testing.T) {
 		t.Fatalf("same pw: %d", rec.Code)
 	}
 	other := e.login("admin", pw) // a second session gets revoked on change
-	if rec := e.req("POST", "/api/auth/password", map[string]string{"current_password": pw, "new_password": "a-brand-new-password"}, c); rec.Code != 204 {
+	rec := e.req("POST", "/api/auth/password", map[string]string{"current_password": pw, "new_password": "a-brand-new-password"}, c)
+	if rec.Code != 200 {
 		t.Fatalf("change: %d %s", rec.Code, rec.Body)
 	}
-	if rec := e.req("GET", "/api/system", nil, c); rec.Code != 200 {
+	// Session ID and CSRF token are rotated on password change.
+	rotated := cred{csrf: decode[map[string]string](t, rec)["csrf_token"]}
+	for _, ck := range rec.Result().Cookies() {
+		if ck.Name == sessionCookie {
+			rotated.cookie = ck.Value
+		}
+	}
+	if rotated.cookie == "" || rotated.cookie == c.cookie || rotated.csrf == "" || rotated.csrf == c.csrf {
+		t.Fatalf("session not rotated: %+v", rotated)
+	}
+	if rec := e.req("GET", "/api/auth/me", nil, c); rec.Code != 401 {
+		t.Fatalf("pre-change session survived: %d", rec.Code)
+	}
+	if rec := e.req("GET", "/api/system", nil, rotated); rec.Code != 200 {
 		t.Fatalf("after change: %d", rec.Code)
+	}
+	if rec := e.req("DELETE", "/api/policies/p2", nil, cred{cookie: rotated.cookie, csrf: c.csrf}); rec.Code != 403 {
+		t.Fatalf("old CSRF token accepted after rotation: %d", rec.Code)
 	}
 	if rec := e.req("GET", "/api/auth/me", nil, other); rec.Code != 401 {
 		t.Fatalf("other session survived password change: %d", rec.Code)
@@ -198,29 +217,220 @@ func TestLoginLockout(t *testing.T) {
 	}
 }
 
+// tryOnce runs one complete attempt against l.
+func tryOnce(l *lockout, user, ip string, ok bool) (time.Duration, bool) {
+	a, d := l.begin(user, ip)
+	if a == nil {
+		return d, false
+	}
+	if ok {
+		a.succeed()
+	} else {
+		a.fail()
+	}
+	return 0, true
+}
+
 func TestLockoutBackoff(t *testing.T) {
 	c := newClock()
 	l := newLockout(c.Now)
-	want := []time.Duration{0, 0, 0, 0, 30 * time.Second, time.Minute, 2 * time.Minute, 4 * time.Minute, 8 * time.Minute, 15 * time.Minute, 15 * time.Minute, 15 * time.Minute}
-	for i, w := range want {
-		l.fail("bob", "10.0.0.1")
-		if got := l.lockedFor("bob", "10.0.0.9"); got != w {
-			t.Fatalf("failure %d: locked %v want %v", i+1, got, w)
+	want := []time.Duration{30 * time.Second, time.Minute, 2 * time.Minute, 4 * time.Minute, 8 * time.Minute, 15 * time.Minute, 15 * time.Minute}
+	for i := range 4 {
+		if _, ok := tryOnce(l, "bob", "10.0.0.1", false); !ok {
+			t.Fatalf("attempt %d refused early", i+1)
 		}
 	}
-	l.success("bob")
-	if l.lockedFor("bob", "10.0.0.9") != 0 {
+	for i, w := range want {
+		if _, ok := tryOnce(l, "bob", "10.0.0.1", false); !ok {
+			t.Fatalf("failure %d refused", i+5)
+		}
+		if d, ok := tryOnce(l, "bob", "10.0.0.9", false); ok || d != w {
+			t.Fatalf("after failure %d: locked %v want %v", i+5, d, w)
+		}
+		c.Advance(w) // lock expires: exactly one more probe allowed
+	}
+	if _, ok := tryOnce(l, "bob", "10.0.0.9", true); !ok {
+		t.Fatal("expired lock refused")
+	}
+	if _, ok := tryOnce(l, "bob", "10.0.0.9", true); !ok {
 		t.Fatal("success did not clear username lock")
 	}
-	if l.lockedFor("alice", "10.0.0.1") == 0 {
+	l2 := newLockout(c.Now)
+	for range 5 {
+		tryOnce(l2, "x", "10.0.0.1", false)
+	}
+	tryOnce(l2, "x", "10.0.0.2", true)
+	if _, ok := tryOnce(l2, "alice", "10.0.0.1", true); ok {
 		t.Fatal("success must not clear the IP lock")
 	}
-	// Bounded memory.
-	for i := range lockoutMaxKeys + 50 {
-		l.fail("u"+itoa64(int64(i)), "10.1.0.1")
+}
+
+func TestLockoutReservesInFlightAttempts(t *testing.T) {
+	l := newLockout(newClock().Now)
+	var held []*attempt
+	for i := range 10 {
+		a, _ := l.begin("bob", "10.0.0."+itoa64(int64(i)))
+		if a != nil {
+			held = append(held, a)
+		}
+	}
+	if len(held) != lockoutThreshold {
+		t.Fatalf("%d attempts in flight, want %d", len(held), lockoutThreshold)
+	}
+	held[0].abort() // cancelled request frees its slot without counting
+	a, _ := l.begin("bob", "10.0.1.1")
+	if a == nil {
+		t.Fatal("aborted reservation not released")
+	}
+	held[0] = a
+	for _, a := range held {
+		a.fail()
+		a.fail() // idempotent
+	}
+	if a, d := l.begin("bob", "10.0.2.1"); a != nil || d != lockoutBase {
+		t.Fatalf("not locked after 5 failures: %v", d)
+	}
+}
+
+func TestLockoutEvictionNeverDropsLocks(t *testing.T) {
+	c := newClock()
+	l := newLockout(c.Now)
+	for i := range lockoutMaxKeys {
+		l.users["u"+itoa64(int64(i))] = &lockEntry{failures: 5, lockedUntil: c.Now().Add(time.Hour), last: c.Now()}
+	}
+	if a, _ := l.begin("newcomer", "10.0.0.1"); a != nil {
+		t.Fatal("tracked a new key by evicting a locked one (or failed open)")
+	}
+	if len(l.users) != lockoutMaxKeys || l.users["u0"] == nil {
+		t.Fatal("locked entry evicted")
+	}
+	// Once locks expire and are forgotten, space is reclaimed.
+	c.Advance(2 * time.Hour)
+	if a, _ := l.begin("newcomer", "10.0.0.1"); a == nil {
+		t.Fatal("no space reclaimed from forgotten entries")
 	}
 	if len(l.users) > lockoutMaxKeys {
-		t.Fatalf("lockout map unbounded: %d", len(l.users))
+		t.Fatalf("unbounded: %d", len(l.users))
+	}
+	// Unlocked live entries may be evicted (oldest first).
+	l3 := newLockout(c.Now)
+	for i := range lockoutMaxKeys {
+		l3.users["v"+itoa64(int64(i))] = &lockEntry{failures: 1, last: c.Now().Add(time.Duration(i) * time.Millisecond)}
+	}
+	if a, _ := l3.begin("w", "10.0.0.1"); a == nil || l3.users["v0"] != nil {
+		t.Fatal("expected oldest unlocked entry evicted")
+	}
+}
+
+func TestLockoutIPv6Bucketing(t *testing.T) {
+	cases := map[string]string{
+		"2001:db8:1:2:aaaa::1": "2001:db8:1:2::/64",
+		"2001:db8:1:2:ffff::9": "2001:db8:1:2::/64",
+		"2001:db8:1:3::1":      "2001:db8:1:3::/64",
+		"192.0.2.1":            "192.0.2.1",
+		"::ffff:192.0.2.1":     "192.0.2.1",
+		"not-an-ip":            "not-an-ip",
+	}
+	for in, want := range cases {
+		if got := lockIPKey(in); got != want {
+			t.Errorf("%s -> %s want %s", in, got, want)
+		}
+	}
+	l := newLockout(newClock().Now)
+	for i := range 5 {
+		tryOnce(l, "u"+itoa64(int64(i)), "2001:db8:1:2::"+itoa64(int64(i+1)), false)
+	}
+	if _, ok := tryOnce(l, "zz", "2001:db8:1:2:dead::1", true); ok {
+		t.Fatal("rotating within a /64 evaded the IP lockout")
+	}
+}
+
+// TestLoginLockoutConcurrent: parallel wrong guesses must not all reach the
+// password verifier (reserve-before-verify).
+func TestLoginLockoutConcurrent(t *testing.T) {
+	e := newEnv(t)
+	var verifies atomic.Int32
+	e.s.onVerify = func() {
+		verifies.Add(1)
+		time.Sleep(20 * time.Millisecond) // keep attempts in flight together
+	}
+	var wg sync.WaitGroup
+	codes := make([]int, 50)
+	for i := range 50 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			codes[i] = e.req("POST", "/api/auth/login", map[string]string{"username": "admin", "password": "guess-" + itoa64(int64(i))}, cred{}).Code
+		}()
+	}
+	wg.Wait()
+	if n := verifies.Load(); n > lockoutThreshold {
+		t.Fatalf("%d password verifications for 50 parallel guesses (max %d)", n, lockoutThreshold)
+	}
+	n401, n429 := 0, 0
+	for _, c := range codes {
+		switch c {
+		case 401:
+			n401++
+		case 429:
+			n429++
+		}
+	}
+	if n401 > lockoutThreshold || n401+n429 != 50 {
+		t.Fatalf("401=%d 429=%d", n401, n429)
+	}
+}
+
+func TestPasswordChangePerSessionLimit(t *testing.T) {
+	e := newEnv(t)
+	e.addUser("bob", RoleEditor)
+	// Login failures against bob from elsewhere must not block bob's
+	// session-authenticated password change (no per-username lock there).
+	bob := e.login("bob", "bob-password-123")
+	for range 5 {
+		e.req("POST", "/api/auth/login", map[string]string{"username": "bob", "password": "nope-nope-nope"}, cred{},
+			func(r *http.Request) { r.RemoteAddr = "198.51.100.1:1" })
+	}
+	if rec := e.req("POST", "/api/auth/password", map[string]string{"current_password": "bob-password-123", "new_password": "bob-new-password-1"}, bob); rec.Code != 200 {
+		t.Fatalf("change blocked by login lockout: %d %s", rec.Code, rec.Body)
+	}
+	// A hijacked session gets 5 guesses, then the session is destroyed.
+	c := e.login("admin", adminPW)
+	for i := range maxPasswordFailures {
+		if rec := e.req("POST", "/api/auth/password", map[string]string{"current_password": "guess-guess-" + itoa64(int64(i)), "new_password": "whatever-whatever"}, c); rec.Code != 401 {
+			t.Fatalf("guess %d: %d", i, rec.Code)
+		}
+	}
+	if rec := e.req("GET", "/api/auth/me", nil, c); rec.Code != 401 {
+		t.Fatal("session survived exhausted password budget")
+	}
+	if rec := e.req("POST", "/api/auth/password", map[string]string{"current_password": adminPW, "new_password": "whatever-whatever"}, c); rec.Code != 401 {
+		t.Fatal("password change allowed after budget exhausted")
+	}
+	// Other sessions of the user are unaffected.
+	if rec := e.req("GET", "/api/auth/me", nil, e.login("admin", adminPW)); rec.Code != 200 {
+		t.Fatal(rec.Code)
+	}
+}
+
+func TestLoginWithStaleCookie(t *testing.T) {
+	e := newEnv(t)
+	rec := e.req("POST", "/api/auth/login", map[string]string{"username": "admin", "password": adminPW}, cred{cookie: "stale-session-id"})
+	if rec.Code != 200 {
+		t.Fatalf("stale cookie blocked login: %d %s", rec.Code, rec.Body)
+	}
+	rec = e.req("POST", "/api/auth/login", map[string]string{"username": "admin", "password": adminPW}, cred{bearer: "rgt_bogus"})
+	if rec.Code != 200 {
+		t.Fatalf("bad bearer blocked login: %d", rec.Code)
+	}
+}
+
+// prodIterations is captured at package init, before TestMain lowers it.
+var prodIterations = pbkdf2Iterations
+
+func TestProductionIterations(t *testing.T) {
+	if prodIterations != 600000 {
+		t.Fatalf("production PBKDF2 iterations = %d, must be 600000", prodIterations)
 	}
 }
 
@@ -475,6 +685,7 @@ func TestUsersAdmin(t *testing.T) {
 	// Role change takes effect on live sessions immediately.
 	bob = e.login("bob", "bob-reset-password")
 	e.req("POST", "/api/auth/password", map[string]string{"current_password": "bob-reset-password", "new_password": "bob-own-password"}, bob)
+	bob = e.login("bob", "bob-own-password") // the change rotated bob's session
 	if rec := e.req("DELETE", "/api/policies/p2", nil, bob); rec.Code != 204 {
 		t.Fatalf("editor delete: %d %s", rec.Code, rec.Body)
 	}

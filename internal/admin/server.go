@@ -32,6 +32,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"ratelimitergateway/internal/model"
@@ -80,10 +81,8 @@ type Options struct {
 	// has no users (RLG_ADMIN_PASSWORD). It must satisfy the password policy.
 	BootstrapPassword string
 
-	// Validate, if non-nil, is run on every candidate snapshot before
-	// Runtime.Apply (wire store.Validate here). When nil nothing extra runs
-	// and Runtime.Apply is relied upon to validate; import dry-runs then
-	// report validated=false.
+	// Validate is run on every candidate snapshot before Runtime.Apply and
+	// for import dry-runs. Nil means store.Validate (tests may override).
 	Validate func(*model.Snapshot) error
 	// TrustProxyHeaders makes the admin plane honour X-Forwarded-For (right-
 	// most entry, i.e. the address seen by the immediate proxy) for lockout
@@ -113,9 +112,16 @@ type Server struct {
 	sseSem   chan struct{} // bounds concurrent SSE streams
 
 	heartbeat time.Duration
+	onVerify  func() // test hook: called for every PBKDF2 verification
+
+	sseMu   sync.Mutex
+	sseByID map[string]int // live streams per principal
 }
 
-const maxSSEStreams = 64
+const (
+	maxSSEStreams             = 64
+	maxSSEStreamsPerPrincipal = 4
+)
 
 // New loads auth.json (bootstrapping an admin user if there are none) and
 // the audit log, and builds the handler.
@@ -128,6 +134,9 @@ func New(o Options) (*Server, error) {
 	}
 	if o.Logger == nil {
 		o.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
+	if o.Validate == nil {
+		o.Validate = store.Validate
 	}
 	if o.now == nil {
 		o.now = time.Now
@@ -168,6 +177,7 @@ func New(o Options) (*Server, error) {
 		hashSem:   make(chan struct{}, max(2, runtime.NumCPU())),
 		sseSem:    make(chan struct{}, maxSSEStreams),
 		heartbeat: 15 * time.Second,
+		sseByID:   map[string]int{},
 	}
 	s.mgr = &manager{store: o.Store, rt: o.Runtime, validate: o.Validate, now: o.now, log: o.Logger}
 	if err := s.bootstrap(); err != nil {
@@ -400,6 +410,11 @@ type handlerFunc func(w http.ResponseWriter, r *http.Request, p *principal)
 func (s *Server) guard(lvl level, h handlerFunc) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		p, aerr := s.authenticate(r)
+		if aerr != nil && lvl == levelPublic {
+			// A stale cookie (or bad bearer) must not block signing in;
+			// a successful login replaces the cookie anyway.
+			p, aerr = nil, nil
+		}
 		if aerr != nil {
 			if aerr.clearCookie {
 				s.clearSessionCookie(w, r)

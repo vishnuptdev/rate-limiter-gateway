@@ -5,7 +5,7 @@
 // Design summary (all memory is bounded):
 //
 //   - Log ring: LogCapacity entries (default 10000). Long string fields are
-//     truncated on Record (path 2048, user agent 256, error 512 bytes).
+//     truncated on Record (every string field is capped, on a UTF-8 boundary).
 //   - Time series: global rings of 720 x 5s buckets (1h) and 1440 x 1m
 //     buckets (24h). Each bucket has counters, status classes and a 41-slot
 //     log-scale latency histogram, so no samples are stored. Per-route rings
@@ -29,6 +29,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"ratelimitergateway/internal/model"
 )
@@ -40,6 +41,8 @@ const (
 	maxPathLen         = 2048
 	maxUALen           = 256
 	maxErrLen          = 512
+	maxIDLen           = 128
+	maxSubBuf          = 4096
 )
 
 // Options configures a Hub.
@@ -130,11 +133,15 @@ func (h *Hub) newID() string {
 	return string(b[:])
 }
 
+// trunc cuts s to at most n bytes on a UTF-8 rune boundary.
 func trunc(s string, n int) string {
-	if len(s) > n {
-		return s[:n]
+	if len(s) <= n {
+		return s
 	}
-	return s
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n]
 }
 
 func decisionKind(d string) int {
@@ -168,6 +175,17 @@ func (h *Hub) Record(e model.LogEntry) {
 	e.Path = trunc(e.Path, maxPathLen)
 	e.UserAgent = trunc(e.UserAgent, maxUALen)
 	e.Error = trunc(e.Error, maxErrLen)
+	e.Method = trunc(e.Method, 16)
+	e.Host = trunc(e.Host, 255)
+	e.ClientIP = trunc(e.ClientIP, 64)
+	e.RateKey = trunc(e.RateKey, 256)
+	e.RouteID = trunc(e.RouteID, maxIDLen)
+	e.RouteName = trunc(e.RouteName, maxIDLen)
+	e.ConsumerID = trunc(e.ConsumerID, maxIDLen)
+	e.ConsumerName = trunc(e.ConsumerName, maxIDLen)
+	e.PolicyID = trunc(e.PolicyID, maxIDLen)
+	e.Source = trunc(e.Source, 32)
+	e.Decision = trunc(e.Decision, 32)
 	if e.Time.IsZero() {
 		e.Time = now
 	}
@@ -336,6 +354,9 @@ func containsFold(s, sub string) bool {
 func (h *Hub) Subscribe(buf int) (<-chan model.LogEntry, func()) {
 	if buf <= 0 {
 		buf = 64
+	}
+	if buf > maxSubBuf {
+		buf = maxSubBuf
 	}
 	s := &subscriber{ch: make(chan model.LogEntry, buf)}
 	h.mu.Lock()

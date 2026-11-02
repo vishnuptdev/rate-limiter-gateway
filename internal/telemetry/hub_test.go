@@ -11,6 +11,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"ratelimitergateway/internal/model"
 )
@@ -818,4 +819,34 @@ func BenchmarkRecordParallelWithSubscriber(b *testing.B) {
 			h.Record(e)
 		}
 	})
+}
+
+func TestTruncateAllFieldsAndRunes(t *testing.T) {
+	h, _ := newTestHub(3)
+	long := strings.Repeat("x", 5000)
+	e := ent("r", "allowed", 200, 1)
+	e.Method, e.Host, e.ClientIP, e.RateKey = long, long, long, long
+	e.RouteID, e.RouteName, e.ConsumerID, e.ConsumerName, e.PolicyID, e.Source = long, long, long, long, long, long
+	h.Record(e)
+	g := h.QueryLogs(model.LogQuery{})[0]
+	if len(g.Method) != 16 || len(g.Host) != 255 || len(g.ClientIP) != 64 || len(g.RateKey) != 256 ||
+		len(g.RouteID) != 128 || len(g.RouteName) != 128 || len(g.ConsumerID) != 128 ||
+		len(g.ConsumerName) != 128 || len(g.PolicyID) != 128 || len(g.Source) != 32 {
+		t.Fatalf("not truncated: %+v", g)
+	}
+	if s := trunc("a\u00e9", 2); s != "a" {
+		t.Fatalf("rune split: %q", s)
+	}
+	if !utf8.ValidString(trunc(strings.Repeat("\u65e5", 100), 16)) {
+		t.Fatal("invalid utf8")
+	}
+}
+
+func TestSubscribeBufferCap(t *testing.T) {
+	h, _ := newTestHub(3)
+	ch, cancel := h.Subscribe(1 << 30)
+	defer cancel()
+	if cap(ch) != maxSubBuf {
+		t.Fatalf("cap=%d", cap(ch))
+	}
 }

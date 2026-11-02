@@ -17,6 +17,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"strconv"
 	"strings"
@@ -32,6 +33,10 @@ const (
 	// arrayPrealloc caps the capacity reserved from an announced array
 	// length; longer arrays grow by append as their elements arrive.
 	arrayPrealloc = 1024
+	// bulkPrealloc is the largest bulk string allocated up front from its
+	// announced length; longer ones are read into a buffer that grows only
+	// as bytes actually arrive.
+	bulkPrealloc = 1 << 20
 	// maxReplyDepth caps array nesting. RateGuard's replies nest at most two
 	// levels; without a cap a hostile server streaming "*1\r\n" forever
 	// drives the recursion until the goroutine stack limit kills the
@@ -274,9 +279,18 @@ func readReplyInto(r *bufio.Reader, rep *Reply, depth int) error {
 			*rep = Reply{Type: '$', IsNil: true}
 			return nil
 		}
-		buf := make([]byte, n+2) // + trailing CRLF
-		if _, err := readFull(r, buf); err != nil {
-			return err
+		var buf []byte
+		if n <= bulkPrealloc {
+			buf = make([]byte, n+2) // + trailing CRLF
+			if _, err := readFull(r, buf); err != nil {
+				return err
+			}
+		} else {
+			var b bytes.Buffer
+			if _, err := io.CopyN(&b, r, n+2); err != nil {
+				return err
+			}
+			buf = b.Bytes()
 		}
 		*rep = Reply{Type: '$', Str: string(buf[:n])}
 	case '*':

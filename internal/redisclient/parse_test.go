@@ -3,6 +3,7 @@ package redisclient
 import (
 	"bufio"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -44,6 +45,27 @@ func TestHostileArrayHeaderDoesNotPreallocate(t *testing.T) {
 	rep, err := readReply(bufio.NewReader(strings.NewReader(b.String())))
 	if err != nil || len(rep.Array) != 3000 || rep.Array[2999].Int != 7 {
 		t.Fatalf("long array: %v %d", err, len(rep.Array))
+	}
+}
+
+// A hostile bulk header announcing ~512MB followed by EOF must not make the
+// client allocate the announced length; a real long bulk still parses.
+func TestHostileBulkHeaderDoesNotPreallocate(t *testing.T) {
+	runtime.GC()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	_, err := readReply(bufio.NewReader(strings.NewReader("$536870000\r\nabc")))
+	runtime.ReadMemStats(&after)
+	if err == nil {
+		t.Fatal("truncated bulk accepted")
+	}
+	if d := after.TotalAlloc - before.TotalAlloc; d > 4<<20 {
+		t.Errorf("allocated %d bytes for a truncated bulk", d)
+	}
+	long := strings.Repeat("x", 3<<20)
+	rep, err := readReply(bufio.NewReader(strings.NewReader("$" + strconv.Itoa(len(long)) + "\r\n" + long + "\r\n")))
+	if err != nil || rep.Str != long {
+		t.Fatalf("long bulk: %v (len %d)", err, len(rep.Str))
 	}
 }
 

@@ -8,7 +8,7 @@ For the detailed behavioural contract, see [ARCHITECTURE.md](ARCHITECTURE.md).
 
 Please report suspected vulnerabilities privately. Do not open a public issue.
 
-- Contact: **[security contact — to be filled in before publication]**
+- Contact: use GitHub private vulnerability reporting: [Report a vulnerability](https://github.com/vishnuptdev/rate-limiter-gateway/security/advisories/new). Please do not open public issues for security problems.
 - Include: affected version or commit, steps to reproduce, and the impact you
   expect.
 - We aim to acknowledge reports within **[N business days — to be set]** and to

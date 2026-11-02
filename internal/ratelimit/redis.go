@@ -29,6 +29,7 @@ var (
 	scSlidingCounter  = newScript(luaSlidingCounter)
 	scFixedWindow     = newScript(luaFixedWindow)
 	scConcurrency     = newScript(luaConcurrency)
+	scGCRA            = newScript(luaGCRA)
 	scConcurrencyRel  = newScript(luaConcurrencyRelease)
 	errBadScriptReply = fmt.Errorf("ratelimit: unexpected script reply")
 )
@@ -116,6 +117,8 @@ func (r *Redis) decide(ctx context.Context, key string, p Params, peek bool) (De
 		sc, args = scSlidingCounter, []string{lim, ms, cost, b01(peek)}
 	case model.AlgoFixedWindow:
 		sc, args = scFixedWindow, []string{lim, ms, cost, b01(peek)}
+	case model.AlgoGCRA, model.AlgoLeakyBucket:
+		sc, args = scGCRA, []string{lim, ms, strconv.Itoa(p.Burst), cost, b01(peek), b01(p.Algorithm == model.AlgoLeakyBucket)}
 	case model.AlgoConcurrency:
 		n, err := nonce()
 		if err != nil {
@@ -129,7 +132,7 @@ func (r *Redis) decide(ctx context.Context, key string, p Params, peek bool) (De
 	if err != nil {
 		return Decision{}, false, err
 	}
-	if len(rep.Array) != 6 {
+	if len(rep.Array) != 6 && len(rep.Array) != 7 {
 		return Decision{}, false, errBadScriptReply
 	}
 	v := func(i int) int64 { return rep.Array[i].Int }
@@ -139,6 +142,9 @@ func (r *Redis) decide(ctx context.Context, key string, p Params, peek bool) (De
 		Remaining:  int(max(v(2), 0)),
 		ResetAfter: time.Duration(max(v(3), 0)) * time.Millisecond,
 		RetryAfter: time.Duration(max(v(4), 0)) * time.Millisecond,
+	}
+	if len(rep.Array) == 7 {
+		d.Delay = time.Duration(max(v(6), 0)) * time.Millisecond
 	}
 	return d, v(5) == 1, nil
 }

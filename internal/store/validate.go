@@ -50,6 +50,10 @@ const (
 	maxName   = 100
 	maxLimit  = 1_000_000_000
 	maxWindow = 365 * 24 * time.Hour
+	maxBurst  = 1_000_000
+	// maxShapingDelay bounds a leaky bucket's queue wait, (burst-1)*window/limit,
+	// so the gateway never parks a request for longer than this.
+	maxShapingDelay = 30 * time.Second
 )
 
 type validator struct{ probs []Problem }
@@ -115,8 +119,8 @@ func Validate(s *model.Snapshot) error {
 				v.add(f+".window", "must be between 1ms and 365d")
 			}
 		}
-		if p.Burst < 0 {
-			v.add(f+".burst", "must be >= 0")
+		if p.Burst < 0 || p.Burst > maxBurst {
+			v.add(f+".burst", "must be between 0 and %d", maxBurst)
 		}
 		if p.Cost < 0 || (p.Limit >= 1 && p.Cost > p.Limit) {
 			v.add(f+".cost", "must be between 0 and limit")
@@ -222,6 +226,8 @@ func Validate(s *model.Snapshot) error {
 		v.add("settings.log_sample_allowed", "must be between 0 and 1")
 	}
 
+	v.shaping(s)
+
 	if len(v.probs) == 0 {
 		return nil
 	}
@@ -237,8 +243,8 @@ func (v *validator) overrides(field string, m map[string]model.LimitOverride, po
 		if o.Limit < 0 || o.Limit > maxLimit {
 			v.add(f+".limit", "must be between 0 and %d", maxLimit)
 		}
-		if o.Burst < 0 {
-			v.add(f+".burst", "must be >= 0")
+		if o.Burst < 0 || o.Burst > maxBurst {
+			v.add(f+".burst", "must be between 0 and %d", maxBurst)
 		}
 		if o.Window.D() < 0 || o.Window.D() > maxWindow {
 			v.add(f+".window", "must be between 0 and 365d")
@@ -271,3 +277,61 @@ func validProxy(s string) bool {
 // ProblemsJSON exposes the problem list to packages (admin) that render it
 // without importing store's concrete types.
 func (e *ValidationError) ProblemsJSON() any { return e.Problems }
+
+// shaping rejects leaky bucket configurations whose maximum queue delay,
+// (burst-1)*window/limit, exceeds maxShapingDelay. The check covers the
+// policy itself and every effective combination reachable through plan and
+// consumer overrides (merged exactly like the gateway: plan, then consumer).
+func (v *validator) shaping(s *model.Snapshot) {
+	plans := map[string]model.Plan{}
+	for _, pl := range s.Plans {
+		plans[pl.ID] = pl
+	}
+	merge := func(l int, w time.Duration, b int, o model.LimitOverride) (int, time.Duration, int) {
+		if o.Limit > 0 {
+			l = o.Limit
+		}
+		if o.Window > 0 {
+			w = o.Window.D()
+		}
+		if o.Burst > 0 {
+			b = o.Burst
+		}
+		return l, w, b
+	}
+	check := func(field string, l int, w time.Duration, b int) {
+		if l < 1 || w <= 0 || b < 0 || b > maxBurst {
+			return // reported elsewhere
+		}
+		if b == 0 {
+			b = l
+		}
+		if d := float64(b-1) * float64(w) / float64(l); d > float64(maxShapingDelay) {
+			v.add(field, "leaky_bucket queue delay (burst-1)*window/limit = %s exceeds the %s maximum; lower burst or window, or raise limit",
+				time.Duration(d).Round(time.Millisecond), maxShapingDelay)
+		}
+	}
+	for i, p := range s.Policies {
+		if p.Algorithm != model.AlgoLeakyBucket {
+			continue
+		}
+		f := fmt.Sprintf("policies[%d]", i)
+		check(f+".burst", p.Limit, p.Window.D(), p.Burst)
+		for j, pl := range s.Plans {
+			if o, ok := pl.Overrides[p.ID]; ok {
+				l, w, b := merge(p.Limit, p.Window.D(), p.Burst, o)
+				check(fmt.Sprintf("plans[%d].overrides[%s].burst", j, p.ID), l, w, b)
+			}
+		}
+		for j, c := range s.Consumers {
+			l, w, b := p.Limit, p.Window.D(), p.Burst
+			if pl, ok := plans[c.PlanID]; ok {
+				l, w, b = merge(l, w, b, pl.Overrides[p.ID])
+			}
+			if o, ok := c.Overrides[p.ID]; ok {
+				l, w, b = merge(l, w, b, o)
+				check(fmt.Sprintf("consumers[%d].overrides[%s].burst", j, p.ID), l, w, b)
+			}
+		}
+	}
+}

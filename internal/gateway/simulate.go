@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/url"
 	"strings"
@@ -105,6 +106,8 @@ func (g *Gateway) Simulate(ctx context.Context, req model.SimRequest) model.SimR
 		p.Allowed, p.Remaining = &allowed, x.dec.Remaining
 		if x.denied {
 			p.RetryAfterMs = x.dec.RetryAfter.Milliseconds()
+		} else if x.dec.Delay > 0 && x.cp.mode != model.ModeShadow {
+			res.Notes = append(res.Notes, fmt.Sprintf("policy %s (leaky bucket): the request would be queued and delayed %d ms before being proxied", x.cp.p.ID, x.dec.Delay.Milliseconds()))
 		}
 	}
 	if len(run.results) < len(res.Policies) {

@@ -17,8 +17,9 @@ Go dependencies (standard library only).
   are forwarded to your upstream; denied requests get `429` with `Retry-After`.
 - **Check API mode.** `POST /_rlg/v1/check` returns an allow/deny decision and
   rate-limit headers, for services that enforce limits themselves.
-- **Five algorithms.** Token bucket, sliding window, sliding-window counter,
-  fixed window, and concurrency (in-flight requests).
+- **Seven algorithms.** Token bucket, sliding window, sliding-window counter,
+  fixed window, concurrency (in-flight requests), GCRA, and leaky bucket
+  (traffic shaping that delays instead of rejecting).
 - **Policies, plans and consumers.** Limits are attached to routes through
   policies. Plans and per-consumer overrides adjust them per customer. Keys are
   hashed at rest and shown once.
@@ -105,6 +106,8 @@ instance watches the config version and picks up changes.
 | `sliding_window_counter` | Weighted blend of the current and previous fixed windows (approximate) | O(1) | You want close-to-exact limits at high volume |
 | `fixed_window` | One counter per calendar-aligned window | O(1) | You want the simplest option and accept up to 2x burst across a window boundary |
 | `concurrency` | Caps in-flight requests; the slot is released when the proxied response completes | O(in-flight) | You want to protect an upstream from simultaneous load (proxy mode only; the check API skips it) |
+| `gcra` | Generic Cell Rate Algorithm: one timestamp per key (the theoretical arrival time); admits at a smooth rate `limit/window` with `burst` tolerance | O(1), one int64 | You want token-bucket behaviour with the smallest possible state, or exact per-request `Retry-After` hints |
+| `leaky_bucket` | Traffic shaping: requests queue and drain at `limit/window`; `burst` is the queue size. Admitted requests are delayed (the gateway waits; max queue delay is validated to <= 30s) instead of rejected; a full queue gives 429 | O(1), one int64 | You must smooth bursts into an even rate for a fragile upstream and prefer latency over errors. The check API returns `delay_ms` rather than sleeping |
 
 Token bucket and sliding window are the two you will reach for most often.
 Token bucket gives burst tolerance: up to `burst` requests go through at once,

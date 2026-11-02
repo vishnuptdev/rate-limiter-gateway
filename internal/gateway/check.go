@@ -42,18 +42,21 @@ type checkResult struct {
 }
 
 type checkResponse struct {
-	Allowed     bool              `json:"allowed"`
-	Decision    string            `json:"decision"`
-	RouteID     string            `json:"route_id,omitempty"`
-	ConsumerID  string            `json:"consumer_id,omitempty"`
-	PolicyID    string            `json:"policy_id,omitempty"`
-	Limit       int               `json:"limit"`
-	Remaining   int               `json:"remaining"`
-	ResetS      int               `json:"reset_s"`
-	RetryAfterS int               `json:"retry_after_s,omitempty"`
-	Error       string            `json:"error,omitempty"`
-	Headers     map[string]string `json:"headers"`
-	Results     []checkResult     `json:"results"`
+	Allowed     bool   `json:"allowed"`
+	Decision    string `json:"decision"`
+	RouteID     string `json:"route_id,omitempty"`
+	ConsumerID  string `json:"consumer_id,omitempty"`
+	PolicyID    string `json:"policy_id,omitempty"`
+	Limit       int    `json:"limit"`
+	Remaining   int    `json:"remaining"`
+	ResetS      int    `json:"reset_s"`
+	RetryAfterS int    `json:"retry_after_s,omitempty"`
+	// DelayMs is how long the caller should hold the request before
+	// proceeding (leaky-bucket shaping). The check API never sleeps itself.
+	DelayMs int64             `json:"delay_ms"`
+	Error   string            `json:"error,omitempty"`
+	Headers map[string]string `json:"headers"`
+	Results []checkResult     `json:"results"`
 }
 
 const maxCheckBody = 64 << 10
@@ -203,6 +206,7 @@ func (g *Gateway) serveCheck(w http.ResponseWriter, r *http.Request) {
 		le.PolicyID, le.RateKey, le.Limit, le.Remaining = b.cp.p.ID, b.composite, resp.Limit, resp.Remaining
 		resp.Headers = rateHeaders(cfg, b, start, out.denier != nil)
 	}
+	_, tooLongSrc, _ := out.shapingDelay()
 	switch {
 	case out.failed != nil:
 		f := out.failed
@@ -214,11 +218,24 @@ func (g *Gateway) serveCheck(w http.ResponseWriter, r *http.Request) {
 		resp.Decision = model.DecisionLimited
 		resp.RetryAfterS = retryAfterSeconds(out.denier.dec)
 		finish(http.StatusTooManyRequests)
+	case tooLongSrc != nil:
+		// Defensive: validation keeps shaping delays under the ceiling.
+		resp.Decision = model.DecisionLimited
+		resp.RetryAfterS = retryAfterSeconds(tooLongSrc.dec)
+		le.Error = "shaping_delay_too_long"
+		finish(http.StatusTooManyRequests)
 	case out.shadow:
 		resp.Allowed, resp.Decision = true, model.DecisionShadowLimited
+		resp.DelayMs = shapeMs(out)
 		finish(http.StatusOK)
 	default:
 		resp.Allowed, resp.Decision = true, model.DecisionAllowed
+		resp.DelayMs = shapeMs(out)
 		finish(http.StatusOK)
 	}
+}
+
+func shapeMs(o *outcome) int64 {
+	d, _, _ := o.shapingDelay()
+	return d.Milliseconds()
 }

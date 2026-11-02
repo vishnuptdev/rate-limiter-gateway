@@ -16,7 +16,6 @@ traffic enters and where your services make their calls.
 |---|---|
 | You can point clients (or a DNS name) at RateGuard | Reverse proxy |
 | You already run NGINX / Traefik / Caddy / Envoy / ingress-nginx and want limits without moving traffic | Forward auth |
-| You need a real `429` and run stock NGINX or ingress-nginx | Reverse proxy (stock `auth_request` turns a `429` into a `500`) |
 | Limits depend on something only your code knows (a cost per operation, a tenant resolved from the body) | Check API |
 | Background jobs or service-to-service calls | Check API |
 | You need leaky-bucket shaping with the request held by the platform | Reverse proxy or forward auth (both wait server-side); the check API only reports `delay_ms` |
@@ -252,7 +251,7 @@ client -> NGINX / Traefik / Caddy / Envoy -> your service
 ### Endpoint contract
 
 `/_rlg/v1/auth`, any method, on the data plane (`:8080`). Enabled by default
-(`Settings.ForwardAuthEnabled`).
+(turn off with `Settings.ForwardAuthDisabled`).
 
 | Input | Source |
 |---|---|
@@ -262,6 +261,7 @@ client -> NGINX / Traefik / Caddy / Envoy -> your service
 | Client IP | `X-Forwarded-For` / `X-Real-IP` **only if the calling proxy is in Trusted proxies**; otherwise the TCP peer |
 | API key | The usual headers (`X-API-Key` or `Authorization: Bearer`) of the forwarded request |
 | Route | `?route_id=<id>` on the auth URL if given, else matched from method/host/path as in proxy mode |
+| Limited status | `?deny_status=401`, `403` or `429` on the auth URL (default 429) |
 | Envoy form | `/_rlg/v1/auth/<original path>?<query>` with the original method; used when no forwarded-URI header is present. `route_id` is ignored in this form |
 
 | Result | Response |
@@ -290,9 +290,14 @@ else gets `401`. Not every proxy can add a static header to its auth request
 
 [`examples/nginx/auth_request.conf`](../examples/nginx/auth_request.conf). Copy the
 `location = /_rateguard_auth` block and add `auth_request /_rateguard_auth;` to the
-protected location. Caveat: stock NGINX passes only `401` and `403` from the auth
-subrequest to the client, so a limited request is shown as `500`. Use the reverse
-proxy example when clients need a real `429`.
+protected location. Stock NGINX passes only `401` and `403` from the auth
+subrequest to the client, so the example calls
+`/_rlg/v1/auth?deny_status=403` and maps it with `error_page 403 = @ratelimited;`
+to a real `429` (the named location returns 429 and copies `Retry-After`).
+
+`deny_status` (`401`, `403` or `429`; default `429`) sets the status of limited
+responses only; the headers and body are unchanged. Like `route_id`, it is an
+operator setting on the auth URL and is ignored in the Envoy appended-path form.
 
 ### Traefik `ForwardAuth`
 
@@ -329,7 +334,7 @@ nginx.ingress.kubernetes.io/auth-url: "http://rateguard.default.svc.cluster.loca
 nginx.ingress.kubernetes.io/auth-response-headers: "X-RateGuard-Consumer, RateLimit-Limit, RateLimit-Remaining, RateLimit-Reset"
 ```
 
-Same `429` to `500` caveat as NGINX.
+Same mechanism as NGINX (`?deny_status=403` plus snippets mapping 403 to 429).
 
 ### Language SDK examples (check API)
 

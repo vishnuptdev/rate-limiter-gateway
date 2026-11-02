@@ -540,13 +540,19 @@ func (g *Gateway) record(cfg *compiled, le model.LogEntry) {
 // writeLimited writes the standard 429 response for a denied (or shaping
 // rejected) policy result: RateLimit-* headers, Retry-After and the JSON body.
 func (g *Gateway) writeLimited(w http.ResponseWriter, cfg *compiled, d *polResult, start time.Time) {
+	g.writeLimitedAs(w, http.StatusTooManyRequests, cfg, d, start)
+}
+
+// writeLimitedAs is writeLimited with a caller-chosen status (forward auth's
+// deny_status); headers and body are identical.
+func (g *Gateway) writeLimitedAs(w http.ResponseWriter, status int, cfg *compiled, d *polResult, start time.Time) {
 	for k, v := range rateHeaders(cfg, d, start, true) {
 		w.Header().Set(k, v)
 	}
 	if cfg.exposeDecision {
 		w.Header().Set("X-RateGuard-Policy", d.cp.p.ID)
 	}
-	writeJSON(w, http.StatusTooManyRequests, map[string]any{
+	writeJSON(w, status, map[string]any{
 		"error": "rate_limited", "message": "Rate limit exceeded", "policy": d.cp.p.Name,
 		"limit": limitOf(d), "remaining": 0, "retry_after_s": retryAfterSeconds(d.dec), "reset_s": ceilSeconds(d.dec.ResetAfter),
 	})

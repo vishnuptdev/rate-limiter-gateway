@@ -5,9 +5,13 @@
 # Annotation reference:
 # https://kubernetes.github.io/ingress-nginx/user-guide/nginx-configuration/annotations/#external-authentication
 #
-# LIMITATION: as with plain NGINX auth_request, only 401/403 from the auth
-# service reach the client; RateGuard's 429 surfaces as a 500. Use RateGuard as
-# a reverse proxy, or Traefik/Envoy, if clients must see a 429.
+# Getting a real 429: ingress-nginx (like NGINX auth_request) only passes 401
+# and 403 from the auth service to the client. The auth-url below uses
+# ?deny_status=403 so limited requests come back as 403, and the snippets turn
+# that into a 429 with a JSON body. Snippet annotations must be allowed by your
+# controller (allow-snippet-annotations); if they are disabled, limited clients
+# see 403 instead. Retry-After is not copied here: add it with auth-response
+# handling of your controller version if you need it.
 #
 # Keep the RateGuard Service cluster-internal (the endpoint is unauthenticated
 # by default) or enable Settings -> Forward auth require token.
@@ -16,7 +20,14 @@ kind: Ingress
 metadata:
   name: api
   annotations:
-    nginx.ingress.kubernetes.io/auth-url: "http://rateguard.default.svc.cluster.local:8080/_rlg/v1/auth"
+    nginx.ingress.kubernetes.io/auth-url: "http://rateguard.default.svc.cluster.local:8080/_rlg/v1/auth?deny_status=403"
+    nginx.ingress.kubernetes.io/configuration-snippet: |
+      error_page 403 = @ratelimited;
+    nginx.ingress.kubernetes.io/server-snippet: |
+      location @ratelimited {
+        default_type application/json;
+        return 429 '{"error":"rate_limited","message":"Rate limit exceeded"}';
+      }
     # Copied from the auth response onto the request sent to the backend.
     nginx.ingress.kubernetes.io/auth-response-headers: "X-RateGuard-Consumer, RateLimit-Limit, RateLimit-Remaining, RateLimit-Reset"
 spec:

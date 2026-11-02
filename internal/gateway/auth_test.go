@@ -219,7 +219,7 @@ func TestForwardAuthToken(t *testing.T) {
 }
 
 func TestForwardAuthDisabled(t *testing.T) {
-	e := authEnv(t, func(s *model.Snapshot) { s.Settings.ForwardAuthEnabled = false })
+	e := authEnv(t, func(s *model.Snapshot) { s.Settings.ForwardAuthDisabled = true })
 	if rr := e.auth("/_rlg/v1/auth", fwd("GET", "/opt/x")); rr.Code != 404 {
 		t.Errorf("got %d", rr.Code)
 	}

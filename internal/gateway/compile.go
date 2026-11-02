@@ -32,7 +32,7 @@ type compiled struct {
 	maxBody        int64
 	sample         float64
 	checkEnabled   bool
-	fwdEnabled     bool
+	fwdDisabled    bool
 	fwdRequireTok  bool
 }
 
@@ -112,7 +112,7 @@ func (g *Gateway) compile(s *model.Snapshot) *compiled {
 		maxBody:        s.Settings.MaxBodyBytes,
 		sample:         s.Settings.LogSampleAllowed,
 		checkEnabled:   s.Settings.CheckAPIEnabled,
-		fwdEnabled:     s.Settings.ForwardAuthEnabled,
+		fwdDisabled:    s.Settings.ForwardAuthDisabled,
 		fwdRequireTok:  s.Settings.ForwardAuthRequireToken,
 		secretHdr:      map[string]bool{},
 	}

@@ -82,8 +82,7 @@ hop, and (c) an embedded admin dashboard.
 - `Settings.MaxBodyBytes > 0` → `http.MaxBytesReader`.
 - Reserved paths (never proxied): `GET /_rlg/healthz` → 200; `GET /_rlg/readyz`
   → 200 if config loaded & engine healthy else 503; `POST /_rlg/v1/check`
-  (if `CheckAPIEnabled`); `/_rlg/v1/auth`, any method (if `ForwardAuthEnabled`,
-  default true; see below).
+  (if `CheckAPIEnabled`); `/_rlg/v1/auth`, any method (unless `ForwardAuthDisabled`; see below).
 - Every request produces one `model.LogEntry` passed to a `Recorder`
   (`Record(model.LogEntry)`); allowed requests sampled by `LogSampleAllowed`.
   `RateKey` must never contain a raw API key.
@@ -133,6 +132,10 @@ and logging with the proxy path; log `Source` is `"forward_auth"`.
 - Envoy form: `/_rlg/v1/auth/<orig path>?<query>` with the original method is
   accepted when no forwarded-URI header is present; `route_id` is ignored there.
 - Route: `?route_id=` if given (unknown → 404), else matched normally.
+- `?deny_status=401|403|429` (default 429, other → 400) sets the limited status
+  (NGINX auth_request only relays 401/403); headers/body unchanged. Like
+  `route_id`, ignored in the Envoy form. The appended path goes through `cleanPath`
+  (also applied by ServeHTTP before routing, so `..` cannot escape the prefix).
 - Responses: allowed → `200`, empty body, `RateLimit-*` headers,
   `X-RateGuard-Consumer`; limited → `429` with the standard JSON body and headers;
   bad/missing key → 401; no route → 404; bad path → 400; limiter failure

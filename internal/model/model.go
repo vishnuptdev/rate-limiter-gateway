@@ -178,9 +178,10 @@ type Settings struct {
 	MaxBodyBytes     int64    `json:"max_body_bytes"`     // 0 => unlimited
 	LogSampleAllowed float64  `json:"log_sample_allowed"` // 0..1 fraction of allowed requests logged (limited/errors always logged)
 	CheckAPIEnabled  bool     `json:"check_api_enabled"`  // enable POST /_rlg/v1/check on the data plane
-	// ForwardAuthEnabled enables /_rlg/v1/auth (NGINX auth_request, Traefik
-	// ForwardAuth, Caddy forward_auth, Envoy ext_authz HTTP, ...).
-	ForwardAuthEnabled bool `json:"forward_auth_enabled"`
+	// ForwardAuthDisabled turns /_rlg/v1/auth off (zero value = enabled, so a
+	// client unaware of the field cannot disable it by accident). The endpoint
+	// serves NGINX auth_request, Traefik ForwardAuth, Caddy forward_auth, etc.
+	ForwardAuthDisabled bool `json:"forward_auth_disabled"`
 	// ForwardAuthRequireToken makes the endpoint demand
 	// X-RateGuard-Auth-Token with a "check"-scoped token.
 	ForwardAuthRequireToken bool     `json:"forward_auth_require_token"`
@@ -189,14 +190,13 @@ type Settings struct {
 
 func DefaultSettings() Settings {
 	return Settings{
-		APIKeyHeader:       "X-API-Key",
-		TrustedProxies:     []string{},
-		GlobalPolicyIDs:    []string{},
-		LegacyHeaders:      true,
-		ExposeDecision:     false,
-		LogSampleAllowed:   1,
-		CheckAPIEnabled:    true,
-		ForwardAuthEnabled: true,
+		APIKeyHeader:     "X-API-Key",
+		TrustedProxies:   []string{},
+		GlobalPolicyIDs:  []string{},
+		LegacyHeaders:    true,
+		ExposeDecision:   false,
+		LogSampleAllowed: 1,
+		CheckAPIEnabled:  true,
 	}
 }
 

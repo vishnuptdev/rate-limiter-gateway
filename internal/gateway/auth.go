@@ -35,7 +35,7 @@ func (g *Gateway) serveAuth(w http.ResponseWriter, r *http.Request, reserved str
 		writeJSON(w, http.StatusServiceUnavailable, errBody("not_ready", "configuration not loaded"))
 		return
 	}
-	if !cfg.fwdEnabled {
+	if cfg.fwdDisabled {
 		writeJSON(w, http.StatusNotFound, errBody("not_found", ""))
 		return
 	}
@@ -104,11 +104,24 @@ func (g *Gateway) serveAuth(w http.ResponseWriter, r *http.Request, reserved str
 	}()
 
 	var route *croute
-	// route_id is operator-configured on the auth URL; in the Envoy form the
+	// route_id and deny_status are operator-configured on the auth URL; in the Envoy form the
 	// query string belongs to the end client, so it is never honoured there.
 	id := ""
+	denyStatus := http.StatusTooManyRequests
 	if reserved == authPath {
-		id = r.URL.Query().Get("route_id")
+		qv := r.URL.Query()
+		id = qv.Get("route_id")
+		switch qv.Get("deny_status") {
+		case "", "429":
+		case "401":
+			denyStatus = http.StatusUnauthorized
+		case "403":
+			denyStatus = http.StatusForbidden
+		default:
+			status = http.StatusBadRequest
+			writeJSON(w, status, errBody("bad_request", "deny_status must be 401, 403 or 429"))
+			return
+		}
 	}
 	if id != "" {
 		route = cfg.byID[id]
@@ -151,8 +164,8 @@ func (g *Gateway) serveAuth(w http.ResponseWriter, r *http.Request, reserved str
 		res, ok := g.reserveShaper(ri, route)
 		if !ok {
 			le.PolicyID, le.RateKey, le.Limit = route.shaper.p.ID, res.composite, res.dec.Limit
-			le.Decision, le.Error, status = model.DecisionLimited, "shaping_queue_full", http.StatusTooManyRequests
-			g.writeLimited(w, cfg, res, start)
+			le.Decision, le.Error, status = model.DecisionLimited, "shaping_queue_full", denyStatus
+			g.writeLimitedAs(w, denyStatus, cfg, res, start)
 			return
 		}
 		slot = true
@@ -178,8 +191,8 @@ func (g *Gateway) serveAuth(w http.ResponseWriter, r *http.Request, reserved str
 		writeJSON(w, status, errBody("limiter_unavailable", "Rate limiter backend unavailable"))
 		return
 	case out.denier != nil:
-		le.Decision, status = model.DecisionLimited, http.StatusTooManyRequests
-		g.writeLimited(w, cfg, out.denier, start)
+		le.Decision, status = model.DecisionLimited, denyStatus
+		g.writeLimitedAs(w, denyStatus, cfg, out.denier, start)
 		return
 	case out.shadow:
 		le.Decision = model.DecisionShadowLimited
@@ -188,8 +201,8 @@ func (g *Gateway) serveAuth(w http.ResponseWriter, r *http.Request, reserved str
 	wait, tooLongSrc, tooLong := out.shapingDelay()
 	if tooLong {
 		le.PolicyID, le.RateKey, le.Limit = tooLongSrc.cp.p.ID, tooLongSrc.composite, limitOf(tooLongSrc)
-		le.Decision, le.Error, status = model.DecisionLimited, "shaping_delay_too_long", http.StatusTooManyRequests
-		g.writeLimited(w, cfg, tooLongSrc, start)
+		le.Decision, le.Error, status = model.DecisionLimited, "shaping_delay_too_long", denyStatus
+		g.writeLimitedAs(w, denyStatus, cfg, tooLongSrc, start)
 		return
 	}
 	if wait > 0 && !waitShaping(r.Context(), wait) {

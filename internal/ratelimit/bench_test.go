@@ -59,7 +59,15 @@ func BenchmarkMemoryAllowSingleKey(b *testing.B) {
 	benchEngine(b, m, 1)
 }
 
-// BenchmarkMemoryAllowManyKeys: 100k distinct keys spread over the shards.
+// BenchmarkMemoryAllow1kKeys: 1024 active keys (state fits in CPU caches).
+func BenchmarkMemoryAllow1kKeys(b *testing.B) {
+	m := NewMemory(MemoryOptions{})
+	defer m.Close()
+	benchEngine(b, m, 1024)
+}
+
+// BenchmarkMemoryAllowManyKeys: 100k distinct keys spread over the shards
+// (state does not fit in cache: mostly bound by memory latency).
 func BenchmarkMemoryAllowManyKeys(b *testing.B) {
 	m := NewMemory(MemoryOptions{})
 	defer m.Close()

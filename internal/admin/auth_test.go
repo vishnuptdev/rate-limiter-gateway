@@ -218,8 +218,8 @@ func TestLoginLockout(t *testing.T) {
 }
 
 // tryOnce runs one complete attempt against l.
-func tryOnce(l *lockout, user, ip string, ok bool) (time.Duration, bool) {
-	a, d := l.begin(user, ip)
+func tryOnce(l *lockout, user string, known bool, ip string, ok bool) (time.Duration, bool) {
+	a, d := l.begin(user, known, ip)
 	if a == nil {
 		return d, false
 	}
@@ -236,31 +236,31 @@ func TestLockoutBackoff(t *testing.T) {
 	l := newLockout(c.Now)
 	want := []time.Duration{30 * time.Second, time.Minute, 2 * time.Minute, 4 * time.Minute, 8 * time.Minute, 15 * time.Minute, 15 * time.Minute}
 	for i := range 4 {
-		if _, ok := tryOnce(l, "bob", "10.0.0.1", false); !ok {
+		if _, ok := tryOnce(l, "bob", true, "10.0.0.1", false); !ok {
 			t.Fatalf("attempt %d refused early", i+1)
 		}
 	}
 	for i, w := range want {
-		if _, ok := tryOnce(l, "bob", "10.0.0.1", false); !ok {
+		if _, ok := tryOnce(l, "bob", true, "10.0.0.1", false); !ok {
 			t.Fatalf("failure %d refused", i+5)
 		}
-		if d, ok := tryOnce(l, "bob", "10.0.0.9", false); ok || d != w {
+		if d, ok := tryOnce(l, "bob", true, "10.0.0.9", false); ok || d != w {
 			t.Fatalf("after failure %d: locked %v want %v", i+5, d, w)
 		}
 		c.Advance(w) // lock expires: exactly one more probe allowed
 	}
-	if _, ok := tryOnce(l, "bob", "10.0.0.9", true); !ok {
+	if _, ok := tryOnce(l, "bob", true, "10.0.0.9", true); !ok {
 		t.Fatal("expired lock refused")
 	}
-	if _, ok := tryOnce(l, "bob", "10.0.0.9", true); !ok {
+	if _, ok := tryOnce(l, "bob", true, "10.0.0.9", true); !ok {
 		t.Fatal("success did not clear username lock")
 	}
 	l2 := newLockout(c.Now)
 	for range 5 {
-		tryOnce(l2, "x", "10.0.0.1", false)
+		tryOnce(l2, "x", true, "10.0.0.1", false)
 	}
-	tryOnce(l2, "x", "10.0.0.2", true)
-	if _, ok := tryOnce(l2, "alice", "10.0.0.1", true); ok {
+	tryOnce(l2, "x", true, "10.0.0.2", true)
+	if _, ok := tryOnce(l2, "alice", true, "10.0.0.1", true); ok {
 		t.Fatal("success must not clear the IP lock")
 	}
 }
@@ -269,7 +269,7 @@ func TestLockoutReservesInFlightAttempts(t *testing.T) {
 	l := newLockout(newClock().Now)
 	var held []*attempt
 	for i := range 10 {
-		a, _ := l.begin("bob", "10.0.0."+itoa64(int64(i)))
+		a, _ := l.begin("bob", true, "10.0.0."+itoa64(int64(i)))
 		if a != nil {
 			held = append(held, a)
 		}
@@ -278,7 +278,7 @@ func TestLockoutReservesInFlightAttempts(t *testing.T) {
 		t.Fatalf("%d attempts in flight, want %d", len(held), lockoutThreshold)
 	}
 	held[0].abort() // cancelled request frees its slot without counting
-	a, _ := l.begin("bob", "10.0.1.1")
+	a, _ := l.begin("bob", true, "10.0.1.1")
 	if a == nil {
 		t.Fatal("aborted reservation not released")
 	}
@@ -287,38 +287,78 @@ func TestLockoutReservesInFlightAttempts(t *testing.T) {
 		a.fail()
 		a.fail() // idempotent
 	}
-	if a, d := l.begin("bob", "10.0.2.1"); a != nil || d != lockoutBase {
+	if a, d := l.begin("bob", true, "10.0.2.1"); a != nil || d != lockoutBase {
 		t.Fatalf("not locked after 5 failures: %v", d)
 	}
 }
 
-func TestLockoutEvictionNeverDropsLocks(t *testing.T) {
+func TestLockoutIPTableNeverDropsLocksOrRefuses(t *testing.T) {
 	c := newClock()
 	l := newLockout(c.Now)
 	for i := range lockoutMaxKeys {
-		l.users["u"+itoa64(int64(i))] = &lockEntry{failures: 5, lockedUntil: c.Now().Add(time.Hour), last: c.Now()}
+		l.ips["junk"+itoa64(int64(i))] = &lockEntry{failures: 5, lockedUntil: c.Now().Add(time.Hour), last: c.Now()}
 	}
-	if a, _ := l.begin("newcomer", "10.0.0.1"); a != nil {
-		t.Fatal("tracked a new key by evicting a locked one (or failed open)")
+	// (a) a full table of locked junk still admits a new IP (overflow bucket).
+	a, d := l.begin("admin", true, "203.0.113.50")
+	if a == nil {
+		t.Fatalf("new IP refused while table saturated (wait %v)", d)
 	}
-	if len(l.users) != lockoutMaxKeys || l.users["u0"] == nil {
-		t.Fatal("locked entry evicted")
+	a.succeed()
+	if len(l.ips) != lockoutMaxKeys || l.ips["junk0"] == nil {
+		t.Fatal("locked entry evicted or table grew")
 	}
-	// Once locks expire and are forgotten, space is reclaimed.
-	c.Advance(2 * time.Hour)
-	if a, _ := l.begin("newcomer", "10.0.0.1"); a == nil {
-		t.Fatal("no space reclaimed from forgotten entries")
+	// Overflow buckets still lock, at the higher threshold.
+	ip := "203.0.113.51"
+	for i := range lockoutOverflowThreshold {
+		if _, ok := tryOnce(l, "", false, ip, false); !ok {
+			t.Fatalf("overflow bucket locked after %d failures", i)
+		}
 	}
-	if len(l.users) > lockoutMaxKeys {
-		t.Fatalf("unbounded: %d", len(l.users))
+	if _, ok := tryOnce(l, "", false, ip, false); ok {
+		t.Fatal("overflow bucket never locks")
 	}
-	// Unlocked live entries may be evicted (oldest first).
-	l3 := newLockout(c.Now)
+	// Unlocked idle entries are evictable, so new IPs get their own entry.
+	l2 := newLockout(c.Now)
 	for i := range lockoutMaxKeys {
-		l3.users["v"+itoa64(int64(i))] = &lockEntry{failures: 1, last: c.Now().Add(time.Duration(i) * time.Millisecond)}
+		l2.ips["v"+itoa64(int64(i))] = &lockEntry{failures: 1, last: c.Now()}
 	}
-	if a, _ := l3.begin("w", "10.0.0.1"); a == nil || l3.users["v0"] != nil {
-		t.Fatal("expected oldest unlocked entry evicted")
+	tryOnce(l2, "", false, "198.51.100.200", false)
+	if l2.ips["198.51.100.200"] == nil || len(l2.ips) != lockoutMaxKeys {
+		t.Fatalf("expected eviction + own entry (len %d)", len(l2.ips))
+	}
+}
+
+func TestLoginTableFloodDoesNotDenyAdmin(t *testing.T) {
+	e := newEnv(t)
+	// (b) 10k junk-username failures (spread over many IPs) neither fill the
+	// username table nor block a real user.
+	for i := range 10000 {
+		a, _ := e.s.lock.begin("junk-"+itoa64(int64(i)), false, "10."+itoa64(int64(i/65536))+"."+itoa64(int64(i/256%256))+"."+itoa64(int64(i%256)))
+		if a != nil {
+			a.fail()
+		}
+	}
+	if len(e.s.lock.users) != 0 {
+		t.Fatalf("unknown usernames tracked: %d", len(e.s.lock.users))
+	}
+	// Saturate the IP table with locked entries too.
+	for i := range lockoutMaxKeys {
+		e.s.lock.ips["x"+itoa64(int64(i))] = &lockEntry{failures: 9, lockedUntil: e.clock.Now().Add(time.Hour), last: e.clock.Now()}
+	}
+	rec := e.req("POST", "/api/auth/login", map[string]string{"username": "admin", "password": adminPW}, cred{},
+		func(r *http.Request) { r.RemoteAddr = "[2001:db8:77::1]:443" })
+	if rec.Code != 200 {
+		t.Fatalf("admin denied after flood: %d %s", rec.Code, rec.Body)
+	}
+	// (c) a real user's per-username lock still applies, from any IP.
+	for i := range 5 {
+		e.req("POST", "/api/auth/login", map[string]string{"username": "admin", "password": "wrong-wrong-wrong"}, cred{},
+			func(r *http.Request) { r.RemoteAddr = "[2001:db8:" + itoa64(int64(100+i)) + "::1]:1" })
+	}
+	rec = e.req("POST", "/api/auth/login", map[string]string{"username": "admin", "password": adminPW}, cred{},
+		func(r *http.Request) { r.RemoteAddr = "[2001:db8:999::1]:1" })
+	if rec.Code != 429 {
+		t.Fatalf("real user's lock not applied: %d", rec.Code)
 	}
 }
 
@@ -338,9 +378,9 @@ func TestLockoutIPv6Bucketing(t *testing.T) {
 	}
 	l := newLockout(newClock().Now)
 	for i := range 5 {
-		tryOnce(l, "u"+itoa64(int64(i)), "2001:db8:1:2::"+itoa64(int64(i+1)), false)
+		tryOnce(l, "u"+itoa64(int64(i)), false, "2001:db8:1:2::"+itoa64(int64(i+1)), false)
 	}
-	if _, ok := tryOnce(l, "zz", "2001:db8:1:2:dead::1", true); ok {
+	if _, ok := tryOnce(l, "zz", false, "2001:db8:1:2:dead::1", true); ok {
 		t.Fatal("rotating within a /64 evaded the IP lockout")
 	}
 }

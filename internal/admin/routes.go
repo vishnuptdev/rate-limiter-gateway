@@ -90,7 +90,8 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request, _ *principa
 	username := strings.TrimSpace(req.Username)
 	// Reserve the attempt atomically before the slow verification so
 	// parallel guesses cannot all slip past the lockout check.
-	att, d := s.lock.begin(username, ip)
+	u, known := s.auth.getUser(username)
+	att, d := s.lock.begin(username, known, ip)
 	if att == nil {
 		secs := int((d + time.Second - 1) / time.Second)
 		writeErr(w, &apiError{Status: http.StatusTooManyRequests, Code: "locked_out",
@@ -98,7 +99,6 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request, _ *principa
 		return
 	}
 	defer att.abort() // no-op once fail/succeed ran
-	u, known := s.auth.getUser(username)
 	hash := s.dummy
 	if known {
 		hash = u.PasswordHash
@@ -212,8 +212,10 @@ func (s *Server) handlePassword(w http.ResponseWriter, r *http.Request, p *princ
 		writeErr(w, &apiError{Status: http.StatusUnauthorized, Code: "unauthorized", Message: "too many failed attempts; please sign in again"})
 		return
 	}
-	good, err := s.verifyBounded(r.Context(), u.PasswordHash, req.CurrentPassword)
-	s.sessions.finishPasswordCheck(p.sessionKey, err == nil && !good)
+	var good bool
+	var err error
+	defer func() { s.sessions.finishPasswordCheck(p.sessionKey, err == nil && !good) }()
+	good, err = s.verifyBounded(r.Context(), u.PasswordHash, req.CurrentPassword)
 	if err != nil {
 		writeErr(w, &apiError{Status: http.StatusServiceUnavailable, Code: "unavailable", Message: "request cancelled"})
 		return
@@ -392,6 +394,7 @@ func (s *Server) handleDeleteUser(w http.ResponseWriter, r *http.Request, p *pri
 		return
 	}
 	s.sessions.deleteUser(name, "")
+	s.lock.forgetUser(name)
 	s.record(r, p, "user.delete", "user", name, "deleted user")
 	w.WriteHeader(http.StatusNoContent)
 }

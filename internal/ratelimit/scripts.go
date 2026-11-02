@@ -236,9 +236,9 @@ if allowed == 0 then retry = hint end
 return {allowed, limit, rem, reset, retry, existed}
 `
 
-// ARGV: none. Frees the lease closest to expiry (the oldest).
+// ARGV: units. Frees that many leases, closest to expiry (oldest) first.
 const luaConcurrencyRelease = luaPrelude + `
 redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', now)
-redis.call('ZPOPMIN', KEYS[1], 1)
+redis.call('ZPOPMIN', KEYS[1], tonumber(ARGV[1]))
 return 1
 `

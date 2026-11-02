@@ -18,6 +18,9 @@ const (
 	// concurrencyIdleTTL: Window is ignored for concurrency, so idle
 	// (nothing in flight) concurrency keys are collected after this long.
 	concurrencyIdleTTL = time.Minute
+	overflowBuckets    = 4096
+	evictSample        = 8
+	overflowWarnEvery  = time.Minute
 )
 
 // MemoryOptions configures a Memory engine. Zero values pick defaults.
@@ -31,12 +34,15 @@ type MemoryOptions struct {
 // Memory is an in-process Engine. State is spread over 64 mutex-protected
 // shards chosen by FNV-1a of the key, so unrelated keys rarely contend.
 //
-// Bounded memory: at most MaxKeys keys are tracked. When full, a request
-// for a new key is still decided (against a fresh, untracked bucket, i.e.
-// it is allowed unless Cost exceeds the limit) but leaves no state, and a
-// warning is logged once. A background goroutine removes keys idle for
-// more than twice their window every GCInterval (token buckets: more than
-// max(2*window, time-to-full)).
+// Bounded memory: at most MaxKeys keys are tracked. When full, a new key
+// first evicts a fully replenished (idle) entry from its shard, sampling up
+// to 8 entries, which loses no information. If none is evictable the key is
+// mapped onto one of 4096 shared overflow buckets (same Params), so a key
+// flood is still rate limited, only coarser; a warning is logged at most
+// once a minute and OverflowActive/OverflowCount expose it. A background
+// goroutine removes keys idle for more than twice their window every
+// GCInterval (token buckets: max(2*window, time-to-full)). Concurrency
+// slots carry a 60s lease like the Redis engine, so a missed Release heals.
 //
 // The exact sliding-window log keeps one record per accepted request in
 // the trailing window, so its memory is O(Limit) per key by definition.
@@ -45,12 +51,23 @@ type Memory struct {
 	now     func() time.Time
 	maxKeys int64
 	keys    atomic.Int64
-	full    sync.Once
 	log     *slog.Logger
+
+	overflow     [overflowBuckets]overflowSlot
+	overflowN    atomic.Int64 // requests served from overflow buckets
+	overflowLast atomic.Int64 // unix ns of last overflow use
+	warnLast     atomic.Int64 // unix ns of last warning
 
 	stop     chan struct{}
 	done     chan struct{}
 	stopOnce sync.Once
+}
+
+// overflowSlot is a shared bucket (one entry per algorithm) used when the key
+// cap is full and nothing can be evicted losslessly.
+type overflowSlot struct {
+	mu sync.Mutex
+	m  map[model.Algorithm]*entry
 }
 
 type shard struct {
@@ -81,8 +98,8 @@ type entry struct {
 	curr   int
 	prev   int
 
-	// concurrency
-	inflight int
+	// concurrency: live leases (expiry ns, units), oldest first
+	leases []logRec
 }
 
 // NewMemory creates a Memory engine and starts its GC goroutine; call
@@ -147,7 +164,7 @@ func (m *Memory) gc() int {
 		s := &m.shards[i]
 		s.mu.Lock()
 		for k, e := range s.m {
-			if now-e.lastSeen > e.idleNs && e.inflight == 0 {
+			if e.idle(now) {
 				delete(s.m, k)
 				m.keys.Add(-1)
 				removed++
@@ -157,6 +174,79 @@ func (m *Memory) gc() int {
 	}
 	return removed
 }
+
+// evictOne removes one fully replenished entry from the shard, sampling at
+// most evictSample entries (map order is random). Caller holds s.mu.
+func (s *shard) evictOne(now int64) bool {
+	n := 0
+	for k, e := range s.m {
+		if e.idle(now) {
+			delete(s.m, k)
+			return true
+		}
+		if n++; n >= evictSample {
+			break
+		}
+	}
+	return false
+}
+
+// idle reports whether the entry is indistinguishable from a fresh one
+// (so dropping it loses nothing): idle past its replenish horizon and with
+// no live concurrency leases.
+func (e *entry) idle(now int64) bool {
+	e.purgeLeases(now)
+	return len(e.leases) == 0 && now-e.lastSeen > e.idleNs
+}
+
+func (e *entry) purgeLeases(now int64) {
+	i := 0
+	for i < len(e.leases) && e.leases[i].ns <= now {
+		i++
+	}
+	if i > 0 {
+		e.leases = append(e.leases[:0], e.leases[i:]...)
+	}
+}
+
+func (m *Memory) overflowSlotFor(sk string) *overflowSlot {
+	h := fnv.New32a()
+	h.Write([]byte(sk))
+	return &m.overflow[h.Sum32()%overflowBuckets]
+}
+
+func (m *Memory) allowOverflow(sk string, p Params, now int64) Decision {
+	m.overflowN.Add(1)
+	m.overflowLast.Store(now)
+	if last := m.warnLast.Load(); now-last >= int64(overflowWarnEvery) && m.warnLast.CompareAndSwap(last, now) {
+		m.log.Warn("ratelimit: memory engine key cap reached; new keys share overflow buckets", "max_keys", m.maxKeys, "overflow_buckets", overflowBuckets)
+	}
+	o := m.overflowSlotFor(sk)
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.m == nil {
+		o.m = make(map[model.Algorithm]*entry, 1)
+	}
+	e := o.m[p.Algorithm]
+	if e == nil {
+		e = &entry{}
+		e.init(p, now)
+		o.m[p.Algorithm] = e
+	}
+	e.lastSeen = now
+	e.idleNs = idleNs(p)
+	return e.eval(p, now, true)
+}
+
+// OverflowActive reports whether, within the last minute, a request was
+// served from a shared overflow bucket because the key cap was full.
+func (m *Memory) OverflowActive() bool {
+	last := m.overflowLast.Load()
+	return last != 0 && m.now().UnixNano()-last < int64(overflowWarnEvery)
+}
+
+// OverflowCount is the total number of requests served from overflow buckets.
+func (m *Memory) OverflowCount() int64 { return m.overflowN.Load() }
 
 // KeyCount returns the number of tracked keys.
 func (m *Memory) KeyCount() int { return int(m.keys.Load()) }
@@ -185,11 +275,12 @@ func (m *Memory) Allow(ctx context.Context, key string, p Params) (Decision, err
 		e.init(p, now)
 		if m.keys.Add(1) > m.maxKeys {
 			m.keys.Add(-1)
-			m.full.Do(func() {
-				m.log.Warn("ratelimit: memory engine key cap reached; new keys are allowed but untracked", "max_keys", m.maxKeys)
-			})
-			// Decide against a fresh bucket, store nothing.
-			return e.eval(p, now, true), nil
+			if !s.evictOne(now) {
+				// Nothing is losslessly evictable: share one of a fixed set
+				// of overflow buckets so the key is still limited.
+				return m.allowOverflow(sk, p, now), nil
+			}
+			m.keys.Add(1)
 		}
 		s.m[sk] = e
 	}
@@ -224,9 +315,26 @@ func (m *Memory) Release(ctx context.Context, key string, p Params) error {
 	s := m.shardFor(storeKey(p.Algorithm, key))
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if e := s.m[storeKey(p.Algorithm, key)]; e != nil && e.inflight > 0 {
-		e.inflight--
-		e.lastSeen = m.now().UnixNano()
+	now := m.now().UnixNano()
+	n := p.Cost
+	if n <= 0 {
+		n = 1
+	}
+	e := s.m[storeKey(p.Algorithm, key)]
+	if e == nil {
+		if !m.OverflowActive() {
+			return nil
+		}
+		// The key may have been mapped onto an overflow bucket.
+		o := m.overflowSlotFor(storeKey(p.Algorithm, key))
+		o.mu.Lock()
+		defer o.mu.Unlock()
+		e = o.m[p.Algorithm]
+	}
+	if e != nil {
+		e.purgeLeases(now)
+		e.dropLeases(n)
+		e.lastSeen = now
 	}
 	return nil
 }
@@ -447,12 +555,29 @@ func (e *entry) fixedWindow(p Params, now int64, consume bool) Decision {
 	return d
 }
 
+// dropLeases frees n units, oldest lease first.
+func (e *entry) dropLeases(n int) {
+	for n > 0 && len(e.leases) > 0 {
+		if e.leases[0].n <= n {
+			n -= e.leases[0].n
+			e.leases = e.leases[1:]
+		} else {
+			e.leases[0].n -= n
+			n = 0
+		}
+	}
+}
+
 func (e *entry) concurrency(p Params, now int64, consume bool) Decision {
-	allowed := p.Cost <= p.Limit && e.inflight+p.Cost <= p.Limit
-	n := e.inflight
+	e.purgeLeases(now)
+	n := 0
+	for _, l := range e.leases {
+		n += l.n
+	}
+	allowed := p.Cost <= p.Limit && n+p.Cost <= p.Limit
 	if allowed && consume {
-		e.inflight += p.Cost
-		n = e.inflight
+		e.leases = append(e.leases, logRec{ns: now + int64(concurrencyLeaseTTL), n: p.Cost})
+		n += p.Cost
 	}
 	d := Decision{Allowed: allowed, Limit: p.Limit, Remaining: max(0, p.Limit-n)}
 	if n > 0 {

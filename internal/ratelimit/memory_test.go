@@ -237,32 +237,45 @@ func TestMemoryGC(t *testing.T) {
 	if n := m.gc(); n != 1 || m.KeyCount() != 1 {
 		t.Fatalf("removed=%d keys=%d, want 1/1", n, m.KeyCount())
 	}
-	// An in-flight concurrency key is never collected.
+	// An in-flight concurrency key is kept while its lease is live and
+	// collected once the lease has expired (missed Release self-heals).
 	cp := Params{Algorithm: model.AlgoConcurrency, Limit: 5}
 	m.Allow(ctx, "c", cp)
-	clk.Advance(time.Hour)
+	clk.Advance(30 * time.Second)
 	m.gc()
 	if d, ok, _ := m.Peek(ctx, "c", cp); !ok || d.Remaining != 4 {
-		t.Fatalf("in-flight key GCed: %+v ok=%v", d, ok)
+		t.Fatalf("live lease key GCed: %+v ok=%v", d, ok)
+	}
+	clk.Advance(2 * time.Minute)
+	if d, _ := m.Allow(ctx, "c", Params{Algorithm: model.AlgoConcurrency, Limit: 1}); !d.Allowed {
+		t.Fatal("expired lease should free the slot")
+	}
+	clk.Advance(5 * time.Minute)
+	m.gc()
+	if _, ok, _ := m.Peek(ctx, "c", cp); ok {
+		t.Fatal("idle concurrency entry should be GCed")
 	}
 }
 
-func TestMemoryMaxKeys(t *testing.T) {
+func TestMemoryMaxKeysFloodStillLimited(t *testing.T) {
 	m, _ := newTestMemory(t, 2)
 	p := Params{Algorithm: model.AlgoFixedWindow, Limit: 1, Window: time.Hour}
-	for _, k := range []string{"a", "b"} {
-		if d, _ := m.Allow(ctx, k, p); !d.Allowed {
-			t.Fatal("tracked key denied")
+	m.Allow(ctx, "a", p)
+	m.Allow(ctx, "b", p)
+	// Neither is idle, so nothing is evictable: flooded keys share overflow
+	// buckets and must hit the limit.
+	allowed := 0
+	const flood = 20000
+	for i := 0; i < flood; i++ {
+		if d, _ := m.Allow(ctx, fmt.Sprintf("flood-%d", i), p); d.Allowed {
+			allowed++
 		}
 	}
-	// Over cap: always allowed (fresh, untracked), never stored.
-	for i := 0; i < 3; i++ {
-		if d, _ := m.Allow(ctx, "overflow", p); !d.Allowed {
-			t.Fatalf("untracked key should be allowed, got %+v", d)
-		}
+	if allowed > overflowBuckets {
+		t.Fatalf("flood allowed %d > %d overflow buckets: limit bypassed", allowed, overflowBuckets)
 	}
-	if m.KeyCount() != 2 {
-		t.Fatalf("KeyCount = %d", m.KeyCount())
+	if allowed == flood || m.KeyCount() != 2 || !m.OverflowActive() || m.OverflowCount() != flood {
+		t.Fatalf("allowed=%d keys=%d active=%v n=%d", allowed, m.KeyCount(), m.OverflowActive(), m.OverflowCount())
 	}
 	if d, _ := m.Allow(ctx, "a", p); d.Allowed {
 		t.Fatal("tracked key must still be limited")
@@ -270,6 +283,41 @@ func TestMemoryMaxKeys(t *testing.T) {
 	m.Reset(ctx, "a", p)
 	if m.KeyCount() != 1 {
 		t.Fatalf("after reset KeyCount = %d", m.KeyCount())
+	}
+}
+
+func TestMemoryMaxKeysLosslessEviction(t *testing.T) {
+	m, clk := newTestMemory(t, 1280)
+	p := Params{Algorithm: model.AlgoFixedWindow, Limit: 1, Window: time.Second}
+	for i := 0; i < 1280; i++ {
+		m.Allow(ctx, fmt.Sprintf("old-%d", i), p)
+	}
+	clk.Advance(5 * time.Second) // all idle: fully replenished
+	for i := 0; i < 1280; i++ {
+		m.Allow(ctx, fmt.Sprintf("new-%d", i), p)
+	}
+	// Eviction is per shard, so a new key landing in a shard that holds no
+	// old entries may overflow; most must have evicted losslessly.
+	if m.OverflowCount() >= 640 {
+		t.Fatalf("idle entries should mostly be evicted, not overflowed: %d", m.OverflowCount())
+	}
+	if m.KeyCount() > 1280 {
+		t.Fatalf("KeyCount = %d exceeds cap", m.KeyCount())
+	}
+}
+
+func TestMemoryConcurrencyCostRelease(t *testing.T) {
+	m, _ := newTestMemory(t, 0)
+	p := Params{Algorithm: model.AlgoConcurrency, Limit: 5, Cost: 3}
+	if d, _ := m.Allow(ctx, "k", p); !d.Allowed || d.Remaining != 2 {
+		t.Fatalf("%+v", d)
+	}
+	if d, _ := m.Allow(ctx, "k", p); d.Allowed {
+		t.Fatal("second cost-3 should not fit")
+	}
+	m.Release(ctx, "k", p)
+	if d, _, _ := m.Peek(ctx, "k", p); d.Remaining != 5 {
+		t.Fatalf("release must free Cost units: %+v", d)
 	}
 }
 
@@ -413,6 +461,19 @@ func releaseSlotTest(t *testing.T, e Engine) {
 	}
 	if d, _ := e.Allow(ctx, key, p); d.Allowed {
 		t.Fatal("over limit after reuse")
+	}
+	// Cost > 1 acquires and releases Cost units.
+	cp := Params{Algorithm: model.AlgoConcurrency, Limit: 4, Cost: 2}
+	ck := key + "-cost"
+	defer e.Reset(ctx, ck, cp)
+	e.Allow(ctx, ck, cp)
+	e.Allow(ctx, ck, cp)
+	if d, _ := e.Allow(ctx, ck, cp); d.Allowed {
+		t.Fatal("cost-2 x3 should not fit in 4")
+	}
+	e.Release(ctx, ck, cp)
+	if d, _ := e.Allow(ctx, ck, cp); !d.Allowed {
+		t.Fatal("Release must free Cost slots")
 	}
 	// Release on a non-concurrency algorithm is a no-op.
 	if err := e.Release(ctx, key, Params{Algorithm: model.AlgoFixedWindow, Limit: 1, Window: time.Second}); err != nil {

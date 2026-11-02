@@ -156,7 +156,11 @@ func (r *Redis) Release(ctx context.Context, key string, p Params) error {
 	if p.Algorithm != model.AlgoConcurrency {
 		return nil
 	}
-	_, err := r.run(ctx, scConcurrencyRel, r.redisKey(p.Algorithm, key), nil)
+	n := p.Cost
+	if n <= 0 {
+		n = 1
+	}
+	_, err := r.run(ctx, scConcurrencyRel, r.redisKey(p.Algorithm, key), []string{strconv.Itoa(n)})
 	return err
 }
 

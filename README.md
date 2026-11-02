@@ -11,9 +11,6 @@ web UI, with an audit trail and live traffic visibility.
 It is one binary with no database, no build step for the UI, and no third-party
 Go dependencies (standard library only).
 
-> Screenshots: _placeholder — dashboard screenshots (Overview, Live Logs,
-> Simulator, Limits inspector) will be added here._
-
 ## Features
 
 - **Reverse proxy mode.** Route by host, path prefix and method. Allowed requests

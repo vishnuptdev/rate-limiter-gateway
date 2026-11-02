@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -29,6 +30,14 @@ func (g *Gateway) Simulate(ctx context.Context, req model.SimRequest) model.SimR
 	path := req.Path
 	if path == "" {
 		path = "/"
+	}
+	if pu, err := url.Parse(path); err == nil {
+		if cp, ok := cleanPath(pu); ok {
+			path = cp
+		} else {
+			res.Decision, res.Notes = model.DecisionError, []string{"path rejected: encoded slash, NUL or backslash"}
+			return res
+		}
 	}
 	hdr := make(map[string]string, len(req.Headers))
 	for k, v := range req.Headers {

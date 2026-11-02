@@ -121,9 +121,10 @@ func (g *Gateway) serveCheck(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, errBody("bad_request", "path is not valid"))
 		return
 	}
-	path := u.Path
-	if path == "" {
-		path = "/"
+	path, okPath := cleanPath(u)
+	if !okPath {
+		writeJSON(w, http.StatusBadRequest, errBody("bad_request", "path is not valid"))
+		return
 	}
 	hdr := make(map[string]string, len(req.Headers))
 	for k, v := range req.Headers {

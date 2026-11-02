@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	pathpkg "path"
 	"strconv"
 	"strings"
 	"sync"
@@ -167,16 +168,44 @@ func errBody(code, msg string) map[string]string {
 }
 
 func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if strings.HasPrefix(r.URL.Path, "/_rlg/") {
-		g.serveReserved(w, r)
+	p, ok := cleanPath(r.URL)
+	if !ok {
+		writeJSON(w, http.StatusBadRequest, errBody("bad_request", ""))
 		return
 	}
-	g.serveProxy(w, r)
+	if strings.HasPrefix(p, "/_rlg/") {
+		g.serveReserved(w, r, p)
+		return
+	}
+	g.serveProxy(w, r, p)
+}
+
+// cleanPath normalises the decoded request path once, at entry: path.Clean
+// (resolving "." / ".." / "//", also after percent-decoding), always
+// leading "/", trailing slash preserved. It reports false for paths that are
+// ambiguous between layers: an encoded slash (%2F), NUL, or a backslash.
+// The result is what is matched, keyed on and forwarded.
+func cleanPath(u *url.URL) (string, bool) {
+	esc := u.EscapedPath()
+	if strings.Contains(strings.ToLower(esc), "%2f") || strings.Contains(esc, "\\") ||
+		strings.ContainsRune(u.Path, 0) || strings.Contains(esc, "%00") || strings.Contains(u.Path, "\\") {
+		return "", false
+	}
+	p := u.Path
+	if p == "" {
+		return "/", true
+	}
+	trailing := strings.HasSuffix(p, "/")
+	p = pathpkg.Clean("/" + p)
+	if trailing && p != "/" {
+		p += "/"
+	}
+	return p, true
 }
 
 // Reserved paths are never proxied, even when no config is loaded.
-func (g *Gateway) serveReserved(w http.ResponseWriter, r *http.Request) {
-	switch r.URL.Path {
+func (g *Gateway) serveReserved(w http.ResponseWriter, r *http.Request, p string) {
+	switch p {
 	case "/_rlg/healthz":
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			w.Header().Set("Allow", "GET, HEAD")
@@ -250,13 +279,13 @@ type reqState struct {
 
 type ctxKey struct{}
 
-func (g *Gateway) serveProxy(w http.ResponseWriter, r *http.Request) {
+func (g *Gateway) serveProxy(w http.ResponseWriter, r *http.Request, cleaned string) {
 	start := g.now()
 	sw := &statusWriter{ResponseWriter: w}
 	w = sw
 	cfg := g.cfg.Load()
 	le := model.LogEntry{
-		Time: start, Method: r.Method, Host: r.Host, Path: r.URL.Path,
+		Time: start, Method: r.Method, Host: r.Host, Path: cleaned,
 		UserAgent: trunc(r.UserAgent()), Source: "proxy", Decision: model.DecisionAllowed,
 	}
 	var out *outcome
@@ -290,7 +319,7 @@ func (g *Gateway) serveProxy(w http.ResponseWriter, r *http.Request) {
 	xff := r.Header.Values("X-Forwarded-For")
 	ip := cfg.clientIP(r.RemoteAddr, xff)
 	le.ClientIP = ip
-	route := cfg.match(r.Host, r.URL.Path, r.Method)
+	route := cfg.match(r.Host, cleaned, r.Method)
 	if route == nil {
 		le.Decision = model.DecisionNoRoute
 		writeJSON(w, http.StatusNotFound, errBody("no_route", ""))
@@ -301,7 +330,7 @@ func (g *Gateway) serveProxy(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-RateGuard-Route", route.r.ID)
 	}
 
-	ri := &reqInfo{method: r.Method, host: r.Host, path: r.URL.Path, ip: ip, route: route, header: r.Header.Get}
+	ri := &reqInfo{method: r.Method, host: r.Host, path: cleaned, ip: ip, route: route, header: r.Header.Get}
 	var q url.Values
 	ri.query = func(name string) string {
 		if q == nil {
@@ -402,12 +431,13 @@ func (g *Gateway) serveProxy(w http.ResponseWriter, r *http.Request) {
 	r2 := r.WithContext(ctx)
 	u := *r.URL
 	r2.URL = &u
+	u.Path, u.RawPath = cleaned, ""
 	if route.r.StripPrefix && route.prefix != "" {
-		p := strings.TrimPrefix(u.Path, route.prefix)
+		p := strings.TrimPrefix(cleaned, route.prefix)
 		if p == "" || p[0] != '/' {
 			p = "/" + p
 		}
-		u.Path, u.RawPath = p, ""
+		u.Path = p
 	}
 	route.proxy.ServeHTTP(w, r2)
 }
@@ -517,7 +547,7 @@ func rewriteRequest(target *url.URL) func(*httputil.ProxyRequest) {
 		out := pr.Out
 		// Spoof protection: never forward client-supplied X-RateGuard-*.
 		for k := range out.Header {
-			if strings.HasPrefix(k, "X-Rateguard-") {
+			if isRGHeader(k) {
 				delete(out.Header, k)
 			}
 		}
@@ -541,7 +571,7 @@ func modifyResponse(resp *http.Response) error {
 	h := resp.Header
 	for k := range h {
 		// Our headers are authoritative; also never leak X-RateGuard-* from upstream.
-		if strings.HasPrefix(k, "X-Rateguard-") {
+		if isRGHeader(k) {
 			delete(h, k)
 		}
 	}
@@ -568,4 +598,11 @@ func proxyError(w http.ResponseWriter, r *http.Request, err error) {
 		return
 	}
 	writeJSON(w, http.StatusBadGateway, errBody("bad_gateway", ""))
+}
+
+// isRGHeader reports whether a header name is in the reserved X-RateGuard-*
+// namespace, treating "_" as "-" so CGI/WSGI-style aliases
+// (X-Rateguard_Consumer) cannot slip through.
+func isRGHeader(k string) bool {
+	return strings.HasPrefix(strings.ReplaceAll(strings.ToLower(k), "_", "-"), "x-rateguard-")
 }

@@ -10,7 +10,11 @@
 # matched by host/path/method.
 #
 # Add Envoy's address to RateGuard's Settings -> Trusted proxies and make sure
-# x-forwarded-for reaches RateGuard (allowed_headers below). Keep the endpoint
+# x-forwarded-for reaches RateGuard (allowed_headers below). Envoy appends the
+# client address to x-forwarded-for only with use_remote_address: true on the
+# HttpConnectionManager; if other proxies sit in front of Envoy, set
+# xff_num_trusted_hops accordingly, and list those proxies in TrustedProxies
+# too, otherwise RateGuard sees the wrong client IP. Keep the endpoint
 # reachable only from Envoy's network (it is unauthenticated by default).
 
 http_filters:

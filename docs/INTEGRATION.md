@@ -256,7 +256,7 @@ client -> NGINX / Traefik / Caddy / Envoy -> your service
 | Input | Source |
 |---|---|
 | Original method | `X-Forwarded-Method`, else `X-Original-Method`, else `GET` |
-| Original path and query | `X-Forwarded-Uri`, else `X-Original-URI`, else `/`. Normalised exactly like proxy-mode paths, so encoded slashes, backslashes and NUL give `400` and `..` is resolved |
+| Original path and query | `X-Forwarded-Uri`, else `X-Original-URI`, else `X-Original-URL` (a full URL, also giving the host), else `/`. Normalised exactly like proxy-mode paths, so encoded slashes, backslashes and NUL give `400` and `..` is resolved |
 | Host | `X-Forwarded-Host`, else `Host` |
 | Client IP | `X-Forwarded-For` / `X-Real-IP` **only if the calling proxy is in Trusted proxies**; otherwise the TCP peer |
 | API key | The usual headers (`X-API-Key` or `Authorization: Bearer`) of the forwarded request |
@@ -330,11 +330,19 @@ forward_auth rateguard:8080 {
 [`examples/k8s/ingress-nginx-auth.yaml`](../examples/k8s/ingress-nginx-auth.yaml):
 
 ```yaml
-nginx.ingress.kubernetes.io/auth-url: "http://rateguard.default.svc.cluster.local:8080/_rlg/v1/auth"
+nginx.ingress.kubernetes.io/auth-url: "http://rateguard.default.svc.cluster.local:8080/_rlg/v1/auth?deny_status=403"
+nginx.ingress.kubernetes.io/auth-snippet: |
+  proxy_set_header X-Forwarded-Method $request_method;
+  proxy_set_header X-Forwarded-Uri $request_uri;
+  proxy_set_header X-Forwarded-Host $host;
 nginx.ingress.kubernetes.io/auth-response-headers: "X-RateGuard-Consumer, RateLimit-Limit, RateLimit-Remaining, RateLimit-Reset"
 ```
 
-Same mechanism as NGINX (`?deny_status=403` plus snippets mapping 403 to 429).
+ingress-nginx sends `X-Original-URL` (a full URL), which RateGuard also accepts, but
+the `auth-snippet` makes the original request explicit. Snippet annotations must be
+enabled on the controller. Same mechanism as NGINX for the `429`
+(`?deny_status=403` plus snippets mapping 403 to 429). Stock `auth_request` turns any
+other non-2xx answer (400, 404, 503) into a `500`.
 
 ### Language SDK examples (check API)
 

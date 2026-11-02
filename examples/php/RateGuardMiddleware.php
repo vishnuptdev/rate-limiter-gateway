@@ -44,7 +44,7 @@ final class RateGuardMiddleware implements MiddlewareInterface
     public function process(ServerRequestInterface $request, RequestHandlerInterface $handler): ResponseInterface
     {
         $decision = $this->check($request);
-        if ($decision === null) {
+        if ($decision === null || ($decision['decision'] ?? '') === 'error') {
             return $handler->handle($request); // fail open
         }
         $headers = is_array($decision['headers'] ?? null) ? $decision['headers'] : [];

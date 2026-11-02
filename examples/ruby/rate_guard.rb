@@ -35,7 +35,8 @@ class RateGuard
 
   def call(env)
     decision = check(Rack::Request.new(env))
-    return @app.call(env) if decision.nil?
+    # decision "error" = limiter backend unavailable: fail open.
+    return @app.call(env) if decision.nil? || decision['decision'] == 'error'
 
     headers = decision['headers'] || {}
     unless decision['allowed'] == false

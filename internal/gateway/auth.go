@@ -49,11 +49,32 @@ func (g *Gateway) serveAuth(w http.ResponseWriter, r *http.Request, reserved str
 
 	method := strings.ToUpper(firstHeader(r, "X-Forwarded-Method", "X-Original-Method"))
 	rawURI := firstHeader(r, "X-Forwarded-Uri", "X-Original-Uri")
+	origHost := ""
+	if rawURI == "" {
+		// ingress-nginx sends the full original URL.
+		if full := firstHeader(r, "X-Original-Url"); full != "" {
+			rest := full
+			if k := strings.Index(rest, "://"); k >= 0 {
+				rest = rest[k+3:]
+			}
+			if k := strings.IndexAny(rest, "/?"); k >= 0 {
+				origHost, rawURI = rest[:k], rest[k:]
+			} else {
+				origHost = rest
+			}
+		}
+	}
 	// Envoy ext_authz (HTTP) sends the original request as-is under
 	// path_prefix: /_rlg/v1/auth/<original path>?<query> with the original
-	// method. Used only when no forwarded-URI header was given.
+	// method. Used only when no forwarded-URI header was given. The encoded
+	// path is kept as sent so %3F, %23 and %25 survive.
 	if rawURI == "" && strings.HasPrefix(reserved, authPath+"/") {
-		rawURI = strings.TrimPrefix(reserved, authPath)
+		esc := r.URL.EscapedPath()
+		if !strings.HasPrefix(esc, authPath+"/") {
+			writeJSON(w, http.StatusBadRequest, errBody("bad_request", "forwarded URI is not valid"))
+			return
+		}
+		rawURI = strings.TrimPrefix(esc, authPath)
 		if r.URL.RawQuery != "" {
 			rawURI += "?" + r.URL.RawQuery
 		}
@@ -64,10 +85,7 @@ func (g *Gateway) serveAuth(w http.ResponseWriter, r *http.Request, reserved str
 	if method == "" {
 		method = http.MethodGet
 	}
-	if rawURI == "" {
-		rawURI = "/"
-	}
-	u, err := url.Parse(rawURI)
+	u, err := parseOriginalURI(rawURI)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, errBody("bad_request", "forwarded URI is not valid"))
 		return
@@ -78,6 +96,9 @@ func (g *Gateway) serveAuth(w http.ResponseWriter, r *http.Request, reserved str
 		return
 	}
 	host := firstHeader(r, "X-Forwarded-Host")
+	if host == "" {
+		host = origHost
+	}
 	if host == "" {
 		host = r.Host
 	}
@@ -227,4 +248,24 @@ func (g *Gateway) serveAuth(w http.ResponseWriter, r *http.Request, reserved str
 		w.Header().Set("X-RateGuard-Consumer", cons.c.ID)
 	}
 	w.WriteHeader(http.StatusOK)
+}
+
+// parseOriginalURI turns an origin-form request target (path[?query]) into a
+// URL without ever treating a leading "//" as a scheme-relative authority:
+// the target is split on the first '?' by hand and the path is only
+// percent-decoded, so "//admin/secret" stays a path (cleaned to
+// "/admin/secret") rather than becoming host "admin" with path "/secret".
+func parseOriginalURI(raw string) (*url.URL, error) {
+	if i := strings.IndexByte(raw, '#'); i >= 0 {
+		raw = raw[:i]
+	}
+	p, q, _ := strings.Cut(raw, "?")
+	if p == "" || p[0] != '/' {
+		p = "/" + p
+	}
+	dec, err := url.PathUnescape(p)
+	if err != nil {
+		return nil, err
+	}
+	return &url.URL{Path: dec, RawPath: p, RawQuery: q}, nil
 }

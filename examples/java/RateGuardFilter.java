@@ -76,6 +76,9 @@ public class RateGuardFilter extends OncePerRequestFilter {
             logger.warn("rateguard: check failed, failing open: " + e.getMessage());
         }
 
+        if (decision != null && "error".equals(decision.path("decision").asText())) {
+            decision = null; // limiter backend unavailable: fail open
+        }
         if (decision == null) {
             chain.doFilter(req, res);
             return;

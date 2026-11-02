@@ -66,6 +66,10 @@ public class RateGuardMiddleware
             _log.LogWarning("rateguard: check failed, failing open: {Message}", e.Message);
         }
 
+        // decision "error" = limiter backend unavailable: fail open.
+        if (decision is JsonElement e0 && e0.TryGetProperty("decision", out var dk) && dk.GetString() == "error")
+            decision = null;
+
         if (decision is JsonElement d)
         {
             if (d.TryGetProperty("headers", out var headers))

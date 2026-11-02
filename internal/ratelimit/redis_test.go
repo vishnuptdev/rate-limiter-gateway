@@ -21,7 +21,7 @@ func testRedisAddr() string {
 
 // newTestRedis returns an engine using a unique key prefix so tests never
 // collide; it skips when Redis is unreachable.
-func newTestRedis(t *testing.T) (*Redis, *redisclient.Client) {
+func newTestRedis(t testing.TB) (*Redis, *redisclient.Client) {
 	t.Helper()
 	c := redisclient.New(testRedisAddr(), 16)
 	if err := c.Ping(); err != nil {

@@ -1,0 +1,54 @@
+name: Bug report
+description: Something does not work as documented
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. For security problems, do not file an issue; see [SECURITY.md](https://github.com/vishnuptdev/rate-limiter-gateway/blob/main/docs/SECURITY.md).
+  - type: input
+    id: version
+    attributes:
+      label: RateGuard version
+      description: Output of `rateguard version`, or the image tag / commit.
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: How are you running it?
+      options: [Docker image, Release binary, Built from source, Kubernetes, Docker Compose]
+    validations:
+      required: true
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Integration mode
+      options: [Reverse proxy, Check API, Forward auth, Dashboard / admin API only, Not sure]
+    validations:
+      required: true
+  - type: input
+    id: engine
+    attributes:
+      label: Engine and store
+      description: Values of RLG_ENGINE and RLG_STORE (memory/redis, file/redis).
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Policy and route settings (without secrets) and the requests you sent help the most.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Redact API keys, tokens and passwords.
+      render: shell

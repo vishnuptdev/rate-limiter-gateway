@@ -3,8 +3,9 @@
 # ---- build -----------------------------------------------------------------
 FROM golang:1.24-alpine AS build
 WORKDIR /src
+ARG VERSION=dev
 COPY . .
-RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o /out/rateguard ./cmd/rateguard \
+RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" -o /out/rateguard ./cmd/rateguard \
  && mkdir -p /out/data
 
 # ---- runtime ---------------------------------------------------------------

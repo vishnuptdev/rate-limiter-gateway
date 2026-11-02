@@ -241,9 +241,15 @@ func (g *Gateway) serveAuth(w http.ResponseWriter, r *http.Request, reserved str
 			w.Header().Set("X-RateGuard-Policy", b.cp.p.ID)
 		}
 	}
+	// Always present (empty when anonymous): proxies that copy it onto the
+	// upstream request (auth_request_set, authResponseHeaders,
+	// allowed_upstream_headers) then overwrite a client-supplied value
+	// instead of keeping it.
+	consumerID := ""
 	if cons != nil {
-		w.Header().Set("X-RateGuard-Consumer", cons.c.ID)
+		consumerID = cons.c.ID
 	}
+	w.Header()["X-Rateguard-Consumer"] = []string{consumerID}
 	w.WriteHeader(http.StatusOK)
 }
 

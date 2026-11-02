@@ -37,6 +37,7 @@ type compiled struct {
 	checkEnabled   bool
 	fwdDisabled    bool
 	fwdRequireTok  bool
+	ipv6Bits       int // prefix length the "ip" key part keeps of IPv6 clients
 }
 
 type croute struct {
@@ -80,6 +81,9 @@ type keyPart struct {
 	// hashVal: header values of credential-bearing headers are hashed so
 	// secrets never land in engine keys, logs or Redis.
 	hashVal bool
+	// bits (partIP): IPv6 clients are keyed by their /bits prefix, so one
+	// client cannot rotate addresses inside its allocation.
+	bits int
 }
 
 type cpolicy struct {
@@ -123,6 +127,10 @@ func (g *Gateway) compile(s *model.Snapshot) *compiled {
 		fwdDisabled:    s.Settings.ForwardAuthDisabled,
 		fwdRequireTok:  s.Settings.ForwardAuthRequireToken,
 		secretHdr:      map[string]bool{},
+		ipv6Bits:       s.Settings.IPv6PrefixLen,
+	}
+	if c.ipv6Bits <= 0 {
+		c.ipv6Bits = 64
 	}
 	hdr := s.Settings.APIKeyHeader
 	if hdr == "" {
@@ -195,7 +203,7 @@ func (g *Gateway) compile(s *model.Snapshot) *compiled {
 		if cr.timeout <= 0 {
 			cr.timeout = 30 * time.Second
 		}
-		if h := strings.ToLower(r.Match.Host); h != "" {
+		if h := trimHostDot(strings.ToLower(r.Match.Host)); h != "" {
 			if strings.HasPrefix(h, "*.") {
 				cr.wildcard, cr.host = true, h[1:]
 			} else {
@@ -257,7 +265,7 @@ func compilePolicy(p *model.Policy, c *compiled) *cpolicy {
 		case k == "api_key":
 			cp.parts = append(cp.parts, keyPart{kind: partAPIKey})
 		case k == "ip":
-			cp.parts = append(cp.parts, keyPart{kind: partIP})
+			cp.parts = append(cp.parts, keyPart{kind: partIP, bits: c.ipv6Bits})
 		case k == "path":
 			cp.parts = append(cp.parts, keyPart{kind: partPath})
 		case k == "method":
@@ -310,7 +318,9 @@ func (r *croute) matches(host, path, method string) bool {
 	return true
 }
 
-// normHost lower-cases and strips a port (IPv6 brackets handled).
+// normHost lower-cases and strips a port (IPv6 brackets handled) and the
+// trailing dot of a fully qualified name, so "API.example.com.:443" and
+// "api.example.com" select the same route.
 func normHost(h string) string {
 	h = strings.ToLower(h)
 	if strings.HasPrefix(h, "[") {
@@ -320,7 +330,17 @@ func normHost(h string) string {
 		return h
 	}
 	if i := strings.LastIndexByte(h, ':'); i >= 0 && strings.Count(h, ":") == 1 {
-		return h[:i]
+		h = h[:i]
+	}
+	return trimHostDot(h)
+}
+
+// trimHostDot strips trailing dots ("example.com." is the same host as
+// "example.com"), keeping a host that is nothing but dots unchanged so it
+// can never become the match-anything empty host.
+func trimHostDot(h string) string {
+	if t := strings.TrimRight(h, "."); t != "" {
+		return t
 	}
 	return h
 }

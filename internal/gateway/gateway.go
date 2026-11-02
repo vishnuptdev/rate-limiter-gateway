@@ -402,6 +402,13 @@ func (g *Gateway) serveProxy(w http.ResponseWriter, r *http.Request, cleaned str
 	xff := r.Header.Values("X-Forwarded-For")
 	ip := cfg.clientIP(r.RemoteAddr, xff)
 	le.ClientIP = ip
+	// h2c would turn the connection into an HTTP/2 tunnel whose streams
+	// bypass per-request routing and limiting: refused on every route.
+	if isH2CUpgrade(r.Header) {
+		le.Decision, le.Error = model.DecisionError, "h2c upgrade refused"
+		writeJSON(w, http.StatusBadRequest, errBody("upgrade_not_allowed", "h2c upgrades are not supported"))
+		return
+	}
 	route := cfg.match(r.Host, cleaned, r.Method)
 	if route == nil {
 		le.Decision = model.DecisionNoRoute
@@ -409,6 +416,13 @@ func (g *Gateway) serveProxy(w http.ResponseWriter, r *http.Request, cleaned str
 		return
 	}
 	le.RouteID, le.RouteName = route.r.ID, route.r.Name
+	// Any other upgrade (WebSocket) is a tunnel limited only as its one
+	// opening request, so a route must opt in.
+	if !route.r.AllowUpgrade && upgradeType(r.Header) != "" {
+		le.Decision, le.Error = model.DecisionError, "upgrade not allowed on route"
+		writeJSON(w, http.StatusBadRequest, errBody("upgrade_not_allowed", "this route does not accept protocol upgrades"))
+		return
+	}
 	if cfg.exposeDecision {
 		w.Header().Set("X-RateGuard-Route", route.r.ID)
 	}
@@ -781,15 +795,125 @@ func rewriteRequest(target *url.URL) func(*httputil.ProxyRequest) {
 				delete(out.Header, k)
 			}
 		}
+		// Not hop-by-hop, but only meaningful for an h2c upgrade (refused).
+		delete(out.Header, "Http2-Settings")
+		if len(out.Trailer) > 0 {
+			stripTrailers(out)
+		}
+		if len(out.Header["Cookie"]) > 0 {
+			stripCookie(out.Header, adminSessionCookie)
+		}
 		if st, _ := pr.In.Context().Value(ctxKey{}).(*reqState); st != nil {
+			// ReverseProxy's Rewrite hook has already removed inbound
+			// Forwarded / X-Forwarded-*; X-Real-IP is replaced the same way
+			// (by the client IP the limits were evaluated with) so an
+			// untrusted client cannot choose it.
 			out.Header.Set("X-Forwarded-For", st.xff)
 			out.Header.Set("X-Forwarded-Proto", st.proto)
 			out.Header.Set("X-Forwarded-Host", st.host)
+			out.Header.Set("X-Real-Ip", st.clientIP)
 			if st.consumerID != "" {
 				out.Header.Set("X-RateGuard-Consumer", st.consumerID)
 			}
 		}
 	}
+}
+
+// adminSessionCookie is the dashboard's session cookie name (admin package,
+// sessionCookie). Browsers send cookies to every port of a host, so when the
+// dashboard and the data plane share a host name the admin session would
+// otherwise be forwarded to upstreams.
+const adminSessionCookie = "rg_session"
+
+// stripCookie removes the named cookie from every Cookie header value,
+// dropping values that become empty. Other cookies pass through unchanged.
+func stripCookie(h http.Header, name string) {
+	vals := h["Cookie"]
+	var out []string
+	changed := false
+	for _, v := range vals {
+		if !strings.Contains(v, name) {
+			out = append(out, v)
+			continue
+		}
+		parts := strings.Split(v, ";")
+		kept := parts[:0]
+		for _, p := range parts {
+			n, _, _ := strings.Cut(p, "=")
+			if strings.TrimSpace(n) == name {
+				changed = true
+				continue
+			}
+			if p = strings.TrimSpace(p); p != "" {
+				kept = append(kept, p)
+			}
+		}
+		if len(kept) > 0 {
+			out = append(out, strings.Join(kept, "; "))
+		}
+	}
+	if !changed {
+		return
+	}
+	if len(out) == 0 {
+		delete(h, "Cookie")
+		return
+	}
+	h["Cookie"] = out
+}
+
+// trailerDenied lists request trailer names (lower case, "_" read as "-")
+// that are never forwarded: hop-by-hop headers and the client-IP headers
+// RateGuard rewrites. X-RateGuard-* is matched by isRGHeader.
+var trailerDenied = map[string]bool{
+	"connection": true, "proxy-connection": true, "keep-alive": true, "proxy-authenticate": true,
+	"proxy-authorization": true, "te": true, "trailer": true, "transfer-encoding": true, "upgrade": true,
+	"http2-settings": true, "host": true, "content-length": true,
+	"x-forwarded-for": true, "x-forwarded-host": true, "x-forwarded-proto": true, "x-real-ip": true, "forwarded": true,
+}
+
+// stripTrailers drops request trailers (and so their Trailer declaration,
+// which the transport rebuilds from out.Trailer) that could smuggle
+// X-RateGuard-*, hop-by-hop or client-IP headers to the upstream.
+func stripTrailers(out *http.Request) {
+	for k := range out.Trailer {
+		if isRGHeader(k) || trailerDenied[strings.ReplaceAll(strings.ToLower(k), "_", "-")] {
+			delete(out.Trailer, k)
+		}
+	}
+	if len(out.Trailer) == 0 {
+		out.Trailer = nil
+	}
+	delete(out.Header, "Trailer")
+}
+
+// headerHasToken reports whether any comma-separated element of the named
+// header equals tok, ignoring ASCII case.
+func headerHasToken(h http.Header, name, tok string) bool {
+	for _, v := range h[name] {
+		for _, t := range strings.Split(v, ",") {
+			if strings.EqualFold(strings.TrimSpace(t), tok) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// upgradeType mirrors httputil.ReverseProxy: a request is an upgrade (and
+// becomes a tunnel on 101) when Connection lists "upgrade"; the protocol is
+// the Upgrade header. Without the Connection token the proxy just drops
+// Upgrade as a hop-by-hop header.
+func upgradeType(h http.Header) string {
+	if len(h["Upgrade"]) == 0 || !headerHasToken(h, "Connection", "upgrade") {
+		return ""
+	}
+	return h.Get("Upgrade")
+}
+
+// isH2CUpgrade reports an h2c upgrade offer, with or without Connection.
+func isH2CUpgrade(h http.Header) bool {
+	return len(h["Upgrade"]) > 0 && headerHasToken(h, "Upgrade", "h2c")
 }
 
 var ownRateHeaders = []string{"Ratelimit-Limit", "Ratelimit-Remaining", "Ratelimit-Reset", "Ratelimit-Policy",

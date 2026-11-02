@@ -122,6 +122,11 @@ type Route struct {
 	Enabled       bool       `json:"enabled"`
 	CreatedAt     time.Time  `json:"created_at"`
 	UpdatedAt     time.Time  `json:"updated_at"`
+	// AllowUpgrade lets HTTP/1.1 Upgrade requests (WebSocket) through this
+	// route. Off by default: an upgraded connection is a raw tunnel that is
+	// rate limited only once, as the single upgrade request. h2c is always
+	// rejected.
+	AllowUpgrade bool `json:"allow_upgrade,omitempty"`
 }
 
 // LimitOverride replaces a policy's numbers for a plan or consumer.
@@ -186,6 +191,11 @@ type Settings struct {
 	// X-RateGuard-Auth-Token with a "check"-scoped token.
 	ForwardAuthRequireToken bool     `json:"forward_auth_require_token"`
 	CORSAllowOrigins        []string `json:"cors_allow_origins,omitempty"` // for the data plane, optional
+	// IPv6PrefixLen is how many leading bits of an IPv6 client address the
+	// "ip" key part uses (32..128; 0 => 64), so a client cannot rotate
+	// through its /64 to get a fresh bucket per address. IPv4 (and
+	// IPv4-mapped) addresses are always used in full.
+	IPv6PrefixLen int `json:"ipv6_prefix_len"`
 }
 
 func DefaultSettings() Settings {
@@ -197,6 +207,7 @@ func DefaultSettings() Settings {
 		ExposeDecision:   false,
 		LogSampleAllowed: 1,
 		CheckAPIEnabled:  true,
+		IPv6PrefixLen:    64,
 	}
 }
 

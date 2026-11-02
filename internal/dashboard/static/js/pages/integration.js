@@ -586,6 +586,7 @@ location @ratelimited {
     { title: 'Traefik — ForwardAuth middleware (docker labels)', lang: 'yaml', code:
 `# Traefik relays RateGuard's 429 (with Retry-After and RateLimit-*) to the client.
 # Add Traefik's network to Settings → Trusted proxies. Do not publish RateGuard's port.
+# Keep forwardauth.trustForwardHeader off so clients cannot set X-Forwarded-Uri.
 # Traefik cannot add a static header to the auth call, so leave
 # "Require token for forward-auth" off and rely on the private network.
 labels:
@@ -605,6 +606,7 @@ ${host || 'api.example.com'} {
 }` },
     { title: 'Envoy — HTTP ext_authz filter', lang: 'yaml', code:
 `# Envoy sends the original method and path after path_prefix, so no X-Forwarded-Uri is needed.
+# Do not allow x-forwarded-uri/-method/-host in allowed_headers (they would override the path).
 # Routes are matched by host/path/method here (?route_id= is ignored).
 # Set use_remote_address: true on the HttpConnectionManager and add Envoy to Trusted proxies.
 http_filters:
@@ -641,7 +643,8 @@ http_filters:
       "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
 # cluster "rateguard": type STRICT_DNS, endpoint ${gwHostPort}` },
     { title: 'ingress-nginx — auth-url annotations', lang: 'yaml', code:
-`# Needs allow-snippet-annotations on the controller. Without snippets, limited clients see 403 instead of 429.
+`# Needs allow-snippet-annotations on the controller. The auth-snippet is required: it overwrites
+# client-supplied X-Forwarded-Uri/-Method/-Host, which RateGuard prefers over X-Original-URL.
 # Add the ingress controller's pod/node CIDR to Settings → Trusted proxies.
 apiVersion: networking.k8s.io/v1
 kind: Ingress

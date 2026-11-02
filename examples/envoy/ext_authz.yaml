@@ -7,7 +7,11 @@
 # path_prefix (here /_rlg/v1/auth/<original path>?<query>); RateGuard accepts
 # that form, so no X-Forwarded-Uri header is needed. In this form the query
 # string belongs to the end client, so ?route_id= is ignored: routes are
-# matched by host/path/method.
+# matched by host/path/method. Do not add x-forwarded-uri, x-forwarded-method
+# or x-forwarded-host to allowed_headers: RateGuard prefers those headers over
+# the appended path, so a client sending them would choose the route checked.
+# RateGuard always returns x-rateguard-consumer on 200 (empty when anonymous),
+# so allowed_upstream_headers overwrites any value the client sent.
 #
 # Add Envoy's address to RateGuard's Settings -> Trusted proxies and make sure
 # x-forwarded-for reaches RateGuard (allowed_headers below). Envoy appends the

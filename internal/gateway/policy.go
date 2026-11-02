@@ -114,7 +114,7 @@ func (ri *reqInfo) part(kp keyPart) string {
 		}
 		return hashHex(ri.apiKey)[:16]
 	case partIP:
-		return ri.ip
+		return maskIP(ri.ip, kp.bits)
 	case partHeader:
 		v := ri.header(kp.name)
 		if v == "" {
@@ -137,6 +137,24 @@ func (ri *reqInfo) part(kp keyPart) string {
 		return ri.route.r.ID
 	}
 	return "global"
+}
+
+// maskIP returns the bucket identity for a client IP: IPv6 addresses are
+// reduced to their /bits prefix ("2001:db8:1:2::/64"); IPv4, IPv4-mapped and
+// unparseable values are returned unchanged.
+func maskIP(ip string, bits int) string {
+	if bits <= 0 || bits >= 128 || strings.IndexByte(ip, ':') < 0 {
+		return ip
+	}
+	a, err := netip.ParseAddr(ip)
+	if err != nil || !a.Is6() || a.Is4In6() {
+		return ip
+	}
+	p, err := a.WithZone("").Prefix(bits)
+	if err != nil {
+		return ip
+	}
+	return p.String()
 }
 
 // effective resolves the numbers for a policy: consumer override > plan

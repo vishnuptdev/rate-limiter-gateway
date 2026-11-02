@@ -49,6 +49,7 @@ function openEditor(existing, policies, done, seed) {
   const timeout = input({ value: r.timeout ? fmt.goDur(r.timeout) : '', placeholder: '30s', mono: true });
   const priority = input({ value: String(r.priority || 0), type: 'number', step: '1' });
   const pol = orderedPicker(policies, r.policy_ids || [], { name: 'policy_ids', disabled: ro, emptyText: 'No route policies — only global policies apply.', metaOf: p => `${fmt.policySummary(p)}${p.mode === 'shadow' ? ' · shadow' : ''}` });
+  const upgrade = toggle({ label: 'Allow WebSocket upgrades', desc: 'an upgraded connection counts as one request; concurrency slots are held while it is open. h2c is always refused.', checked: !!r.allow_upgrade, name: 'allow_upgrade' });
   const requireKey = toggle({ label: 'Require API key', desc: 'reject anonymous requests with 401', checked: r.require_api_key, name: 'require_api_key' });
   const enabled = toggle({ label: 'Enabled', checked: r.enabled, name: 'enabled' });
   const summary = h('div', { class: 'summary-callout' });
@@ -58,7 +59,7 @@ function openEditor(existing, policies, done, seed) {
     ...(isNew && id.value.trim() ? { id: id.value.trim() } : {}),
     name: name.value.trim(),
     match: { host: host.value.trim(), path_prefix: prefix.value.trim(), methods: methods.value() },
-    upstream: upstream.value.trim(), strip_prefix: strip.input.checked,
+    upstream: upstream.value.trim(), strip_prefix: strip.input.checked, allow_upgrade: upgrade.input.checked,
     timeout: timeout.value.trim() || undefined, priority: parseInt(priority.value, 10) || 0,
     policy_ids: pol.value(), require_api_key: requireKey.input.checked, enabled: enabled.input.checked,
   });
@@ -93,7 +94,7 @@ function openEditor(existing, policies, done, seed) {
       h('div', { class: 'form-grid' },
         field({ label: 'Upstream URL', name: 'upstream', control: upstream, full: true, hint: 'Absolute http(s) URL the gateway proxies to.' }),
         field({ label: 'Timeout', name: 'timeout', control: timeout, optional: true, hint: 'Go duration, e.g. 15s or 1m. Default 30s.' })),
-      strip),
+      strip, upgrade),
     h('div', { class: 'form-section' },
       sectionTitle('Rate limiting & auth', 'Global policies from Settings run first, then these — in order. The first enforcing deny wins.'),
       field({ label: 'Policies', name: 'policy_ids', control: pol }),

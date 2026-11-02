@@ -32,6 +32,11 @@ const (
 	// arrayPrealloc caps the capacity reserved from an announced array
 	// length; longer arrays grow by append as their elements arrive.
 	arrayPrealloc = 1024
+	// maxReplyDepth caps array nesting. RateGuard's replies nest at most two
+	// levels; without a cap a hostile server streaming "*1\r\n" forever
+	// drives the recursion until the goroutine stack limit kills the
+	// process (a fatal error, not a recoverable panic).
+	maxReplyDepth = 32
 )
 
 // Options configures a Client.
@@ -231,14 +236,14 @@ func parseInt(b []byte) (int64, error) {
 
 func readReply(r *bufio.Reader) (*Reply, error) {
 	rep := new(Reply)
-	if err := readReplyInto(r, rep); err != nil {
+	if err := readReplyInto(r, rep, 0); err != nil {
 		return nil, err
 	}
 	return rep, nil
 }
 
-// readReplyInto parses one reply into rep.
-func readReplyInto(r *bufio.Reader, rep *Reply) error {
+// readReplyInto parses one reply into rep; depth is its array nesting level.
+func readReplyInto(r *bufio.Reader, rep *Reply, depth int) error {
 	line, err := readLine(r)
 	if err != nil {
 		return err
@@ -286,6 +291,9 @@ func readReplyInto(r *bufio.Reader, rep *Reply) error {
 			*rep = Reply{Type: '*', IsNil: true}
 			return nil
 		}
+		if n > 0 && depth >= maxReplyDepth {
+			return errors.New("redis: reply nested too deeply")
+		}
 		// Never trust the announced length for up-front allocation: a
 		// hostile "*16777215" header must not cost ~1GB before a single
 		// element arrives. Start small and grow only as elements are
@@ -293,7 +301,7 @@ func readReplyInto(r *bufio.Reader, rep *Reply) error {
 		items := make([]*Reply, 0, min(n, arrayPrealloc))
 		for i := int64(0); i < n; i++ {
 			item := new(Reply)
-			if err := readReplyInto(r, item); err != nil {
+			if err := readReplyInto(r, item, depth+1); err != nil {
 				return err
 			}
 			items = append(items, item)

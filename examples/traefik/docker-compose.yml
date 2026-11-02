@@ -1,5 +1,7 @@
 # Traefik v2/v3 ForwardAuth middleware calling RateGuard's /_rlg/v1/auth.
-# Traefik sends X-Forwarded-Method/-Uri/-Host/-For itself. Add Traefik's
+# Traefik sends X-Forwarded-Method/-Uri/-Host/-For itself, overwriting client
+# values; keep forwardauth.trustForwardHeader off (the default), otherwise a
+# client's X-Forwarded-Uri decides which route is checked. Add Traefik's
 # address (the Docker network subnet) to RateGuard's Settings -> Trusted
 # proxies so the client IP is read from X-Forwarded-For.
 # Option names: https://doc.traefik.io/traefik/middlewares/http/forwardauth/

@@ -272,7 +272,19 @@ func (h *Hub) recordRoute(id string, sec int64, kind, cls, hi int) {
 	}
 }
 
+// queryChunk is how many ring entries QueryLogs copies per lock hold. The
+// lock is held only for that copy (a few microseconds); filtering, including
+// the substring search, runs unlocked, so a viewer's search never stalls
+// Record on the data plane's hot path.
+const queryChunk = 128
+
 // QueryLogs returns matching entries, newest first.
+//
+// The ring is walked by sequence number: the entry with sequence s lives at
+// index (s-1) % len(logs) until it is overwritten, i.e. while
+// s > seq-len(logs). The walk starts at the newest entry when the query
+// begins and stops at the oldest one still present, so entries recorded
+// during the scan are not included and overwritten ones are never misread.
 func (h *Hub) QueryLogs(q model.LogQuery) []model.LogEntry {
 	limit := q.Limit
 	if limit <= 0 {
@@ -283,43 +295,53 @@ func (h *Hub) QueryLogs(q model.LogQuery) []model.LogEntry {
 	}
 	search := strings.ToLower(q.Search)
 	out := make([]model.LogEntry, 0, min(limit, 64))
+	buf := make([]model.LogEntry, queryChunk)
 
 	h.mu.Lock()
-	defer h.mu.Unlock()
-	n := len(h.logs)
-	for i := 0; i < h.nlogs && len(out) < limit; i++ {
-		e := &h.logs[((h.head-1-i)%n+n)%n]
-		if q.Before != "" && e.ID >= q.Before {
-			continue
+	next := h.seq // newest entry's sequence number; 0 = empty
+	h.mu.Unlock()
+	for next > 0 && len(out) < limit {
+		h.mu.Lock()
+		n := uint64(len(h.logs))
+		oldest := uint64(1)
+		if h.seq > n {
+			oldest = h.seq - n + 1
 		}
-		if q.Decision != "" && e.Decision != q.Decision {
-			continue
+		k := 0
+		for ; k < queryChunk && next >= oldest && next > 0; k++ {
+			buf[k] = h.logs[(next-1)%n]
+			next--
 		}
-		if q.RouteID != "" && e.RouteID != q.RouteID {
-			continue
+		if next < oldest {
+			next = 0 // the rest has been overwritten (or never existed)
 		}
-		if q.ConsumerID != "" && e.ConsumerID != q.ConsumerID {
-			continue
+		h.mu.Unlock()
+
+		for i := 0; i < k && len(out) < limit; i++ {
+			if e := &buf[i]; queryMatches(&q, e, search) {
+				out = append(out, *e)
+			}
 		}
-		if q.PolicyID != "" && e.PolicyID != q.PolicyID {
-			continue
-		}
-		if q.StatusMin > 0 && e.Status < q.StatusMin {
-			continue
-		}
-		if q.StatusMax > 0 && e.Status > q.StatusMax {
-			continue
-		}
-		if !q.Since.IsZero() && e.Time.Before(q.Since) {
-			continue
-		}
-		if search != "" && !(containsFold(e.Path, search) || containsFold(e.ClientIP, search) ||
-			containsFold(e.RateKey, search) || containsFold(e.ConsumerName, search)) {
-			continue
-		}
-		out = append(out, *e)
 	}
 	return out
+}
+
+// queryMatches reports whether e passes every filter of q; search is
+// q.Search lower-cased.
+func queryMatches(q *model.LogQuery, e *model.LogEntry, search string) bool {
+	switch {
+	case q.Before != "" && e.ID >= q.Before,
+		q.Decision != "" && e.Decision != q.Decision,
+		q.RouteID != "" && e.RouteID != q.RouteID,
+		q.ConsumerID != "" && e.ConsumerID != q.ConsumerID,
+		q.PolicyID != "" && e.PolicyID != q.PolicyID,
+		q.StatusMin > 0 && e.Status < q.StatusMin,
+		q.StatusMax > 0 && e.Status > q.StatusMax,
+		!q.Since.IsZero() && e.Time.Before(q.Since):
+		return false
+	}
+	return search == "" || containsFold(e.Path, search) || containsFold(e.ClientIP, search) ||
+		containsFold(e.RateKey, search) || containsFold(e.ConsumerName, search)
 }
 
 // containsFold reports whether s contains sub (already lower-case),

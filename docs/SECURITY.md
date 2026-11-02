@@ -184,6 +184,26 @@ not attach them automatically.
 - [ ] Use Redis for shared state across instances, and monitor the engine's health
       on the Overview page or at `/api/system`.
 
+## Hardening
+
+Protections built into the data plane and its dependencies. Each has a
+regression test (`internal/gateway/hardening_test.go`,
+`internal/telemetry/hardening_test.go`, `internal/redisclient/parse_test.go`).
+
+| Area | Protection |
+|---|---|
+| Forward-auth trust | RateGuard evaluates the route described by `X-Forwarded-Uri` (preferred over `X-Original-URI` / `X-Original-URL`), `X-Forwarded-Method` and `X-Forwarded-Host`. **The calling proxy must set these headers on every auth request**; a proxy that passes client-supplied values through lets the client choose the route that is checked. All shipped examples and dashboard snippets set them; with ingress-nginx the `auth-snippet` is required, with Traefik keep `trustForwardHeader` off, with Envoy do not allow those headers through `allowed_headers`. See [INTEGRATION.md](INTEGRATION.md#trust-requirement-the-proxy-must-set-the-forwarded-headers) |
+| Forward-auth consumer header | An allowed answer always carries `X-RateGuard-Consumer` (empty when anonymous), so proxies that copy it onto the upstream request overwrite a client-sent value |
+| IPv6 address rotation | The `ip` key part keys IPv6 clients by prefix: `Settings.IPv6PrefixLen` (default 64, valid 32..128, 128 = per address). IPv4 and IPv4-mapped addresses are always keyed in full |
+| Protocol upgrades | `Upgrade: h2c` is refused with `400` on every route (an h2c connection would multiplex unmetered requests) and `HTTP2-Settings` is never forwarded. WebSocket and other upgrades are refused (`400 upgrade_not_allowed`) unless the route sets `allow_upgrade`; an allowed upgrade counts as one request, concurrency policies hold their slot for the connection's lifetime, and the route timeout and the data-plane server's read/write timeouts (60 s / 120 s) bound it |
+| Header spoofing | Inbound `X-RateGuard-*` headers (including `_` variants such as `X-Rateguard_Consumer`) are stripped. Request trailers named `X-RateGuard-*`, hop-by-hop headers (`Connection`, `Keep-Alive`, `TE`, `Upgrade`, ...) or client-IP headers are dropped together with their `Trailer` declaration |
+| Client-IP headers | Upstreams get `X-Forwarded-For` replaced by the peer address for untrusted peers (appended to only for trusted proxies), `X-Real-IP` set to the client IP RateGuard limited on, and no inbound `Forwarded` |
+| Dashboard session cookie | The `rg_session` cookie is removed from proxied requests. Browsers send cookies to every port of a host, so a dashboard sharing a host name with the data plane would otherwise leak admin sessions to upstreams. Other cookies pass through. API keys are never read from cookies |
+| Route matching | Hosts compare case-insensitively with any port and trailing dot ignored (`API.example.com.:443` = `api.example.com`). Paths are **case-sensitive** and `;params` are part of the path; give catch-all routes limits you can live with for such variants. Configure hosts in their ASCII (punycode) form: RateGuard does not convert IDNs |
+| Telemetry lock | Log searches copy the ring in chunks of 128 entries under the hub lock and filter outside it, so a dashboard search never stalls `Record` on the request path |
+| Redis replies | Bulk and array lengths are range-checked, arrays are not preallocated from the announced length, and nesting is capped at 32 levels, so a hostile or corrupted Redis cannot exhaust memory or overflow the stack |
+| Slow clients | Both listeners set `ReadHeaderTimeout` (10 s) and `ReadTimeout`; the data plane also `WriteTimeout`. The admin listener's `WriteTimeout` is 0 for the live-log stream, which requires an authenticated session or `read` token before it streams, caps streams globally and per user, and sets a 30 s deadline on every write |
+
 ## Known limitations
 
 These are things we want operators to know about. Several have planned fixes.

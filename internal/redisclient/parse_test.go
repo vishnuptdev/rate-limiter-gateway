@@ -47,6 +47,20 @@ func TestHostileArrayHeaderDoesNotPreallocate(t *testing.T) {
 	}
 }
 
+// SA10: array nesting is capped, so a hostile server cannot drive the
+// parser's recursion into a fatal stack overflow.
+func TestReplyNestingCapped(t *testing.T) {
+	deep := strings.Repeat("*1\r\n", 1_000_000) + ":1\r\n"
+	if _, err := readReply(bufio.NewReader(strings.NewReader(deep))); err == nil ||
+		!strings.Contains(err.Error(), "nested too deeply") {
+		t.Fatalf("deep nesting: %v", err)
+	}
+	ok := strings.Repeat("*1\r\n", maxReplyDepth) + ":1\r\n"
+	if _, err := readReply(bufio.NewReader(strings.NewReader(ok))); err != nil {
+		t.Fatalf("nesting at the cap: %v", err)
+	}
+}
+
 func TestReadReplyForms(t *testing.T) {
 	longErr := "-ERR " + strings.Repeat("x", 10000) + "\r\n"
 	in := ":42\r\n:-7\r\n:+3\r\n:12345678901234567890\r\n:9223372036854775807\r\n+OK\r\n$5\r\nhello\r\n$-1\r\n*-1\r\n" +

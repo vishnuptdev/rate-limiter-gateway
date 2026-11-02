@@ -1,0 +1,129 @@
+# RateGuard on Kubernetes: Secret, Deployment (2 replicas), Service.
+#
+# Before applying:
+# - Replace the image with your registry's RateGuard image (built with `make docker`).
+# - Do not commit real secrets. Create the Secret out of band, for example:
+#     kubectl create secret generic rateguard-secrets \
+#       --from-literal=RLG_ADMIN_PASSWORD='...' \
+#       --from-literal=RLG_REDIS_PASSWORD='...'
+#   and delete the stringData block below, or use External Secrets / Sealed Secrets.
+# - Redis is NOT deployed by this manifest. RLG_REDIS_ADDR must point at an existing
+#   Redis (for example a managed Redis, or a Redis Service in the same cluster) that
+#   uses AUTH and, ideally, TLS (RLG_REDIS_TLS=true).
+# - Both replicas use RLG_ENGINE=redis and RLG_STORE=redis, so they share limits and
+#   config. Each pod's /data is an emptyDir: auth.json (users, API tokens) and
+#   audit.jsonl are lost when a pod is rescheduled. For durable users and audit, run
+#   the instances as a StatefulSet with a volumeClaimTemplate per pod, and see
+#   docs/SECURITY.md.
+# - The admin port (9000) should be reachable only from your admin network. Restrict
+#   it with a NetworkPolicy or an internal Ingress. The Service below exposes it for
+#   convenience inside the cluster.
+
+apiVersion: v1
+kind: Secret
+metadata:
+  name: rateguard-secrets
+type: Opaque
+stringData:
+  RLG_ADMIN_PASSWORD: "replace-me-with-at-least-12-chars"
+  RLG_REDIS_PASSWORD: "replace-me"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rateguard
+  labels:
+    app.kubernetes.io/name: rateguard
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: rateguard
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: rateguard
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: rateguard
+          image: rateguard:latest # replace with your registry path and tag
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: admin
+              containerPort: 9000
+          env:
+            - name: RLG_ENGINE
+              value: redis
+            - name: RLG_STORE
+              value: redis
+            - name: RLG_REDIS_ADDR
+              value: redis.default.svc.cluster.local:6379 # replace with your Redis endpoint
+            - name: RLG_REDIS_TLS
+              value: "true"
+            - name: RLG_DATA_DIR
+              value: /data
+            - name: RLG_COOKIE_SECURE
+              value: "true"
+            - name: RLG_LOG_LEVEL
+              value: info
+          envFrom:
+            - secretRef:
+                name: rateguard-secrets
+          readinessProbe:
+            httpGet:
+              path: /_rlg/readyz
+              port: 8080
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /_rlg/healthz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rateguard
+  labels:
+    app.kubernetes.io/name: rateguard
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: rateguard
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+    - name: admin
+      port: 9000
+      targetPort: admin

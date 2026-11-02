@@ -19,6 +19,8 @@ async function gatewayTab(el) {
     const legacy = toggle({ label: 'Legacy X-RateLimit-* headers', desc: 'also emit X-RateLimit-Limit/-Remaining/-Reset', checked: !!s.legacy_headers, name: 'legacy_headers' });
     const expose = toggle({ label: 'Expose decision headers', desc: 'add X-RateGuard-Route / -Policy to responses', checked: !!s.expose_decision, name: 'expose_decision' });
     const check = toggle({ label: 'Decision (check) API', desc: 'enable POST /_rlg/v1/check on the data plane', checked: s.check_api_enabled !== false, name: 'check_api_enabled' });
+    const fwdOn = toggle({ label: 'Forward-auth endpoint', desc: 'serve GET/POST /_rlg/v1/auth for NGINX auth_request, Traefik ForwardAuth, Caddy forward_auth, Envoy ext_authz and ingress-nginx. Turn off if you only use the reverse proxy or the check API.', checked: !s.forward_auth_disabled, name: 'forward_auth_disabled' });
+    const fwdTok = toggle({ label: 'Require token for forward-auth', desc: 'callers must send X-RateGuard-Auth-Token with a “check”-scoped API token. Leave off when the proxy cannot add a header (Traefik) and the endpoint is only reachable on a private network.', checked: !!s.forward_auth_require_token, name: 'forward_auth_require_token' });
     const maxBody = input({ value: s.max_body_bytes ? String(s.max_body_bytes) : '', type: 'number', min: '0', placeholder: 'unlimited' });
     const maxHint = h('span');
     const paintMax = () => { maxHint.textContent = +maxBody.value ? `= ${fmt.bytes(+maxBody.value)}` : 'Empty or 0 = unlimited.'; };
@@ -45,6 +47,10 @@ async function gatewayTab(el) {
         h('div', { class: 'form-section-title' }, 'Responses'),
         legacy, expose, check),
       h('div', { class: 'form-section' },
+        h('div', { class: 'form-section-title' }, 'Forward auth'),
+        h('div', { class: 'muted' }, 'Lets your own proxy ask RateGuard “allow or deny?” per request without sending traffic through it. See Integration → Forward auth.'),
+        fwdOn, fwdTok),
+      h('div', { class: 'form-section' },
         h('div', { class: 'form-section-title' }, 'Limits & logging'),
         h('div', { class: 'form-grid' },
           field({ label: 'Max request body', name: 'max_body_bytes', control: h('div', { class: 'input-group' }, maxBody, h('span', { class: 'addon' }, 'bytes')), optional: true, hint: maxHint }),
@@ -59,6 +65,7 @@ async function gatewayTab(el) {
           await api.put('/settings', {
             ...s, api_key_header: header.value.trim(), trusted_proxies: listValue(proxies.value), global_policy_ids: globals.value(),
             legacy_headers: legacy.input.checked, expose_decision: expose.input.checked, check_api_enabled: check.input.checked,
+            forward_auth_disabled: !fwdOn.input.checked, forward_auth_require_token: fwdTok.input.checked,
             max_body_bytes: parseInt(maxBody.value, 10) || 0, log_sample_allowed: +sample.value, cors_allow_origins: listValue(cors.value),
           });
           toast('good', 'Settings saved', 'Applied to the gateway immediately.');

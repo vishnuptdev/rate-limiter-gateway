@@ -42,7 +42,14 @@ export class ApiError extends Error {
 let csrfToken = '';
 export const setCSRF = t => { csrfToken = t || ''; };
 
+// Mock mode is a local-development aid only: it is ignored unless the page is
+// served from localhost / 127.0.0.1 / [::1] or opened from a file: URL, so a
+// crafted ?mock=1 link can never fake a "signed in" UI on a real deployment.
+function mockAllowed() {
+  return location.protocol === 'file:' || ['localhost', '127.0.0.1', '[::1]'].includes(location.hostname);
+}
 function readFlag() {
+  if (!mockAllowed()) return false;
   try {
     const q = new URLSearchParams(location.search);
     if (q.get('mock') === '0') { localStorage.removeItem('rg-mock'); return false; }

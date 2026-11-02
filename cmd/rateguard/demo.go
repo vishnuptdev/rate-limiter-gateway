@@ -34,10 +34,11 @@ func demoSnapshot(log *slog.Logger, dataDir string) (*model.Snapshot, error) {
 			KeyBy: keyBy, Mode: model.ModeEnforce, FailMode: model.FailOpen, Enabled: true, CreatedAt: now, UpdatedAt: now}
 	}
 	s.Policies = []model.Policy{
-		pol("per-consumer", "Per-consumer rate", "Smooth per-customer rate with short bursts", model.AlgoTokenBucket, 60, time.Minute, 20, "consumer"),
+		pol("per-consumer", "Per-consumer rate", "Smooth per-customer rate, no boundary bursts (GCRA)", model.AlgoGCRA, 60, time.Minute, 20, "consumer"),
 		pol("per-ip-strict", "Anonymous IP limit", "Hard cap for unauthenticated traffic", model.AlgoSlidingWindowCounter, 30, time.Minute, 0, "ip"),
 		pol("login-bruteforce", "Login brute-force guard", "5 attempts per minute per IP on auth endpoints", model.AlgoSlidingWindow, 5, time.Minute, 0, "ip", "path"),
 		pol("global-ceiling", "Global ceiling", "Protects the upstream from total overload", model.AlgoFixedWindow, 5000, time.Second, 0, "global"),
+		pol("upload-shaper", "Upload shaper", "Smooths upload traffic to a steady 20/s with a 40-request queue", model.AlgoLeakyBucket, 20, time.Second, 40, "consumer"),
 		pol("concurrent-exports", "Concurrent exports", "At most 2 in-flight export jobs per customer", model.AlgoConcurrency, 2, 0, 0, "consumer"),
 	}
 	shadow := pol("new-limit-trial", "Proposed tighter limit (shadow)", "Dry-run of a stricter limit: logged, never enforced", model.AlgoTokenBucket, 20, time.Minute, 5, "consumer")
@@ -52,6 +53,7 @@ func demoSnapshot(log *slog.Logger, dataDir string) (*model.Snapshot, error) {
 	s.Routes = []model.Route{
 		route("auth", "Auth endpoints", "/auth", 20, false, "login-bruteforce"),
 		route("exports", "Data exports", "/api/exports", 10, true, "per-consumer", "concurrent-exports"),
+		route("uploads", "Uploads", "/api/uploads", 10, true, "upload-shaper"),
 		route("api", "Public API", "/api", 5, true, "per-consumer", "new-limit-trial"),
 		route("public", "Public pages", "/", 0, false, "per-ip-strict"),
 	}

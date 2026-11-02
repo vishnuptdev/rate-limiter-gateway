@@ -17,7 +17,8 @@ function csv(rows) {
   const esc = v => {
     if (v == null) return '';
     let s = String(v);
-    if (/^[=+\-@\t\r]/.test(s)) s = "'" + s; // neutralise spreadsheet formulas
+    // Neutralise spreadsheet formulas, but leave plain numbers (e.g. -1, +5, -0.25, 1e3) alone.
+    if (/^[=+\-@\t\r]/.test(s) && !/^[+-]?(\d+\.?\d*|\.\d+)(e[+-]?\d+)?$/i.test(s)) s = "'" + s;
     return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
   };
   return [CSV_COLS.join(','), ...rows.map(r => CSV_COLS.map(c => esc(r[c])).join(','))].join('\r\n');

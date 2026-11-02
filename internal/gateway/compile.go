@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"ratelimitergateway/internal/model"
+	"ratelimitergateway/internal/ratelimit"
 )
 
 // compiled is the immutable, request-ready form of a Snapshot. It is built
@@ -86,6 +87,9 @@ type cpolicy struct {
 	failMode model.FailMode
 	cost     int
 	conc     bool
+	// policyHdr is the precomputed RateLimit-Policy value for the policy's
+	// own Limit/Window (overrides recompute it).
+	policyHdr string
 }
 
 var credentialHeaders = map[string]bool{
@@ -231,6 +235,7 @@ func compilePolicy(p *model.Policy, c *compiled) *cpolicy {
 	if cp.cost <= 0 {
 		cp.cost = 1
 	}
+	cp.policyHdr = policyHeader(ratelimit.Params{Limit: p.Limit, Window: p.Window.D()})
 	for _, k := range p.KeyBy {
 		switch {
 		case k == "consumer":

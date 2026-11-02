@@ -85,12 +85,46 @@ func New(o Options) *Gateway {
 	if g.log == nil {
 		g.log = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
-	t := http.DefaultTransport.(*http.Transport).Clone()
-	t.MaxIdleConnsPerHost = 64
-	t.MaxIdleConns = 512
-	g.transport = t
+	g.transport = newTransport()
 	return g
 }
+
+// newTransport is the upstream transport shared by every route. Keep-alive
+// pools are sized so a busy upstream does not churn connections (each
+// extra dial costs a loopback/LAN round trip plus TIME_WAIT state); HTTP/2
+// is negotiated for TLS upstreams.
+func newTransport() *http.Transport {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.MaxIdleConns = 2048
+	t.MaxIdleConnsPerHost = 512
+	t.IdleConnTimeout = 90 * time.Second
+	t.ForceAttemptHTTP2 = true
+	return t
+}
+
+// bufferPool recycles the 32KB copy buffers ReverseProxy would otherwise
+// allocate for every proxied response body (the dominant allocation on the
+// proxy path). Pointers to slices are pooled to avoid an allocation per Put.
+type bufferPool struct{ p sync.Pool }
+
+const proxyBufSize = 32 << 10
+
+func (b *bufferPool) Get() []byte {
+	if v, ok := b.p.Get().(*[]byte); ok {
+		return *v
+	}
+	return make([]byte, proxyBufSize)
+}
+
+func (b *bufferPool) Put(buf []byte) {
+	if cap(buf) != proxyBufSize {
+		return
+	}
+	buf = buf[:proxyBufSize]
+	b.p.Put(&buf)
+}
+
+var proxyBuffers = &bufferPool{}
 
 // noEngine is used when Options.Engine is nil.
 type noEngine struct{}
@@ -143,6 +177,7 @@ func (g *Gateway) proxyFor(key string, target *url.URL) *httputil.ReverseProxy {
 		FlushInterval:  -1, // stream (SSE, chunked) responses straight through
 		ModifyResponse: modifyResponse,
 		ErrorHandler:   proxyError,
+		BufferPool:     proxyBuffers,
 		ErrorLog:       slog.NewLogLogger(g.log.Handler(), slog.LevelDebug),
 	}
 	g.proxies[key] = p
@@ -468,9 +503,7 @@ func (g *Gateway) serveProxy(w http.ResponseWriter, r *http.Request, cleaned str
 	st = &reqState{consumerID: le.ConsumerID, clientIP: ip, started: g.now()}
 	st.xff, st.proto, st.host = forwardedFor(cfg, r, xff)
 	if b := out.best; b != nil {
-		for k, v := range rateHeaders(cfg, b, start, false) {
-			w.Header().Set(k, v)
-		}
+		setRateHeaders(w.Header(), cfg, b, start, false)
 		st.rlHeaders = true
 		if cfg.exposeDecision {
 			w.Header().Set("X-RateGuard-Policy", b.cp.p.ID)
@@ -546,9 +579,7 @@ func (g *Gateway) writeLimited(w http.ResponseWriter, cfg *compiled, d *polResul
 // writeLimitedAs is writeLimited with a caller-chosen status (forward auth's
 // deny_status); headers and body are identical.
 func (g *Gateway) writeLimitedAs(w http.ResponseWriter, status int, cfg *compiled, d *polResult, start time.Time) {
-	for k, v := range rateHeaders(cfg, d, start, true) {
-		w.Header().Set(k, v)
-	}
+	setRateHeaders(w.Header(), cfg, d, start, true)
 	if cfg.exposeDecision {
 		w.Header().Set("X-RateGuard-Policy", d.cp.p.ID)
 	}
@@ -589,11 +620,7 @@ func rateHeaders(cfg *compiled, r *polResult, now time.Time, limited bool) map[s
 		"RateLimit-Reset":     strconv.Itoa(reset),
 	}
 	if !r.cp.conc {
-		w := ceilSeconds(r.params.Window)
-		if w < 1 {
-			w = 1
-		}
-		h["RateLimit-Policy"] = strconv.Itoa(r.params.Limit) + ";w=" + strconv.Itoa(w)
+		h["RateLimit-Policy"] = policyHeader(r.params)
 	}
 	if cfg.legacyHeaders {
 		h["X-RateLimit-Limit"] = h["RateLimit-Limit"]
@@ -604,6 +631,53 @@ func rateHeaders(cfg *compiled, r *polResult, now time.Time, limited bool) map[s
 		h["Retry-After"] = strconv.Itoa(retryAfterSeconds(r.dec))
 	}
 	return h
+}
+
+// setRateHeaders writes exactly the headers rateHeaders describes into h
+// (same names after canonicalisation, same values, replacing any existing
+// value like Header.Set) without building an intermediate map: the
+// canonical names are constants, all values share one backing array, and
+// the RateLimit-Policy value is precomputed per policy at compile time when
+// no plan/consumer override changed the numbers.
+func setRateHeaders(h http.Header, cfg *compiled, r *polResult, now time.Time, limited bool) {
+	n := 5
+	if cfg.legacyHeaders {
+		n = 8
+	}
+	vals := make([]string, n)
+	put := func(i int, k, v string) {
+		vals[i] = v
+		h[k] = vals[i : i+1 : i+1]
+	}
+	reset := ceilSeconds(r.dec.ResetAfter)
+	lim, rem := strconv.Itoa(limitOf(r)), strconv.Itoa(r.dec.Remaining)
+	put(0, "Ratelimit-Limit", lim)
+	put(1, "Ratelimit-Remaining", rem)
+	put(2, "Ratelimit-Reset", strconv.Itoa(reset))
+	if !r.cp.conc {
+		pv := r.cp.policyHdr
+		if r.params.Limit != r.cp.p.Limit || r.params.Window != r.cp.p.Window.D() {
+			pv = policyHeader(r.params)
+		}
+		put(3, "Ratelimit-Policy", pv)
+	}
+	if limited {
+		put(4, "Retry-After", strconv.Itoa(retryAfterSeconds(r.dec)))
+	}
+	if cfg.legacyHeaders {
+		put(5, "X-Ratelimit-Limit", lim)
+		put(6, "X-Ratelimit-Remaining", rem)
+		put(7, "X-Ratelimit-Reset", strconv.FormatInt(now.Add(time.Duration(reset)*time.Second).Unix(), 10))
+	}
+}
+
+// policyHeader is the RateLimit-Policy value ("<limit>;w=<window seconds>").
+func policyHeader(p ratelimit.Params) string {
+	w := ceilSeconds(p.Window)
+	if w < 1 {
+		w = 1
+	}
+	return strconv.Itoa(p.Limit) + ";w=" + strconv.Itoa(w)
 }
 
 // ---------------------------------------------------------------------

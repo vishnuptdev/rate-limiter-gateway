@@ -237,9 +237,7 @@ func (g *Gateway) serveAuth(w http.ResponseWriter, r *http.Request, reserved str
 	}
 
 	if b := out.best; b != nil {
-		for k, v := range rateHeaders(cfg, b, start, false) {
-			w.Header().Set(k, v)
-		}
+		setRateHeaders(w.Header(), cfg, b, start, false)
 		if cfg.exposeDecision {
 			w.Header().Set("X-RateGuard-Policy", b.cp.p.ID)
 		}

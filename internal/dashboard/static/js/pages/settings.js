@@ -30,7 +30,6 @@ async function gatewayTab(el) {
     const paintSample = () => { sampleVal.textContent = Math.round(+sample.value * 100) + '%'; };
     sample.addEventListener('input', paintSample); paintSample();
     const v6 = input({ value: String(s.ipv6_prefix_len || 64), type: 'number', min: '32', max: '128', step: '1' });
-    const cors = textarea({ value: (s.cors_allow_origins || []).join('\n'), placeholder: 'https://app.example.com', code: true, rows: 2 });
     const formId = nextId('gs');
     const submit = h('button', { class: 'btn primary', type: 'submit', form: formId }, 'Save settings');
     const form = h('form', { class: 'form', id: formId, novalidate: true },
@@ -55,9 +54,8 @@ async function gatewayTab(el) {
         h('div', { class: 'form-section-title' }, 'Limits & logging'),
         h('div', { class: 'form-grid' },
           field({ label: 'Max request body', name: 'max_body_bytes', control: h('div', { class: 'input-group' }, maxBody, h('span', { class: 'addon' }, 'bytes')), optional: true, hint: maxHint }),
-          field({ label: 'IPv6 prefix for “ip” keys', name: 'ipv6_prefix_len', control: h('div', { class: 'input-group' }, v6, h('span', { class: 'addon' }, 'bits')), hint: 'IPv6 clients are limited per /64 by default so they can’t rotate addresses. 32–128; 128 = per address. IPv4 is always per address.' }),
-          field({ label: 'Log sample (allowed requests)', name: 'log_sample_allowed', control: h('div', { class: 'stack tight' }, sample, h('div', { class: 'row small' }, sampleVal, h('span', { class: 'muted' }, 'of allowed requests are logged. Limited & errors are always logged.'))) }),
-          field({ label: 'CORS allowed origins', name: 'cors_allow_origins', control: cors, optional: true, hint: 'For the data plane. One per line.', full: true }))));
+          field({ label: 'IPv6 prefix for client-IP keys', name: 'ipv6_prefix_len', control: h('div', { class: 'input-group' }, v6, h('span', { class: 'addon' }, 'bits')), hint: 'Used by “ip” keys and the anonymous “consumer” fallback. IPv6 clients are limited per /64 by default so they can’t rotate addresses. 32–128; 128 = per address. IPv4 is always per address.' }),
+          field({ label: 'Log sample (allowed requests)', name: 'log_sample_allowed', control: h('div', { class: 'stack tight' }, sample, h('div', { class: 'row small' }, sampleVal, h('span', { class: 'muted' }, 'of allowed requests are logged. Limited & errors are always logged.'))) }))));
     if (!admin) form.querySelectorAll('input, textarea, select, button').forEach(x => { x.disabled = true; });
     form.addEventListener('submit', async e => {
       e.preventDefault();
@@ -68,7 +66,7 @@ async function gatewayTab(el) {
             ...s, api_key_header: header.value.trim(), trusted_proxies: listValue(proxies.value), global_policy_ids: globals.value(),
             legacy_headers: legacy.input.checked, expose_decision: expose.input.checked, check_api_enabled: check.input.checked,
             forward_auth_disabled: !fwdOn.input.checked, forward_auth_require_token: fwdTok.input.checked,
-            max_body_bytes: parseInt(maxBody.value, 10) || 0, ipv6_prefix_len: parseInt(v6.value, 10) || 0, log_sample_allowed: +sample.value, cors_allow_origins: listValue(cors.value),
+            max_body_bytes: parseInt(maxBody.value, 10) || 0, ipv6_prefix_len: parseInt(v6.value, 10) || 0, log_sample_allowed: +sample.value,
           });
           toast('good', 'Settings saved', 'Applied to the gateway immediately.');
         } catch (err) { showFormError(form, err); if (err.status !== 422) toast('crit', 'Couldn’t save settings', err.friendly); }

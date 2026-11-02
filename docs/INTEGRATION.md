@@ -43,9 +43,9 @@ limit is counted against.
 In **Policies**, create a policy and set:
 
 - **Algorithm**: one of `token_bucket`, `sliding_window`, `sliding_window_counter`,
-  `fixed_window`, `concurrency`. See the [algorithm table](../README.md#choosing-an-algorithm).
+  `fixed_window`, `concurrency`, `gcra`, `leaky_bucket`. See the [algorithm table](../README.md#choosing-an-algorithm).
 - **Limit** and, for window algorithms, **window** (for example 100 per 1 minute) and
-  optional **burst** for token bucket.
+  optional **burst** (token bucket, GCRA; queue size for leaky bucket).
 - **KeyBy**: what the limit is counted per. Typical choices are the API key
   (`api_key`), the client IP, or a header value. Combine parts when needed.
 - **Mode**: `enforce` denies requests. `shadow` records would-be denials and lets

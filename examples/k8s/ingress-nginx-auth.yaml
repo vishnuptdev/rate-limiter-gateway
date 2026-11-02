@@ -1,7 +1,9 @@
 # ingress-nginx using RateGuard as the auth-url (forward auth). ingress-nginx
 # sends X-Original-URL (a full URL) and X-Auth-Request-Redirect with the auth
-# subrequest. RateGuard reads X-Original-URL, but the auth-snippet below also
-# sets X-Forwarded-Method/-Uri/-Host explicitly, which is the most reliable.
+# subrequest. RateGuard reads X-Original-URL, but the auth-snippet below is
+# REQUIRED: it overwrites X-Forwarded-Method/-Uri/-Host. Without it a client
+# can send its own X-Forwarded-Uri, which ingress-nginx passes through and
+# RateGuard prefers over X-Original-URL, choosing the route that is checked.
 # Snippet annotations must be enabled on the controller
 # (allow-snippet-annotations: "true"; newer controllers also restrict snippet
 # risk levels via annotations-risk-level). Add the ingress controller's pod/node CIDR to RateGuard's

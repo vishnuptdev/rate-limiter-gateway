@@ -42,12 +42,22 @@ hop, and (c) an embedded admin dashboard.
 ## Data plane behaviour (`internal/gateway`)
 
 - Listener default `:8080`.
-- Route selection: enabled routes only; match host (exact or `*.suffix`),
-  path prefix (segment-aware: `/api` matches `/api` and `/api/x`, not `/apix`),
-  method. Highest `Priority` wins; ties → longest `PathPrefix`; ties → ID.
+- Route selection: enabled routes only; match host (exact or `*.suffix`;
+  case-insensitive, port and trailing dot ignored on both sides),
+  path prefix (segment-aware: `/api` matches `/api` and `/api/x`, not `/apix`;
+  case-sensitive), method. Highest `Priority` wins; ties → longest `PathPrefix`; ties → ID.
   No match → `404 {"error":"no_route"}`.
 - Client IP: `RemoteAddr`; if the immediate peer is in `Settings.TrustedProxies`,
   walk `X-Forwarded-For` right-to-left skipping trusted hops.
+- `ip` key part: IPv6 addresses are masked to `Settings.IPv6PrefixLen` bits
+  (32..128, 0 → 64), keyed as `2001:db8:1:2::/64`; IPv4 and IPv4-mapped
+  addresses are used in full.
+- Upgrades: `Upgrade: h2c` (with or without `Connection: Upgrade`) → `400
+  {"error":"upgrade_not_allowed"}` on every route. Any other upgrade
+  (`Connection: upgrade` + `Upgrade`) → same 400 unless `Route.AllowUpgrade`.
+  An allowed upgrade is evaluated as one request; concurrency slots are held
+  until the tunnel closes; the tunnel is bounded by the route timeout and the
+  server read/write timeouts.
 - API key: header `Settings.APIKeyHeader` (default `X-API-Key`) or
   `Authorization: Bearer <key>`. Look up by sha256 hex → consumer. Revoked,
   expired, or disabled consumer = invalid. If route `RequireAPIKey` and key
@@ -77,7 +87,10 @@ hop, and (c) an embedded admin dashboard.
 - Proxy: `httputil.ReverseProxy` per upstream (cached), `StripPrefix`,
   sets `X-Forwarded-For/Proto/Host`, adds `X-RateGuard-Consumer` (ID) upstream,
   strips the inbound API key header? **No** (upstreams may need it) — but strips
-  any inbound `X-RateGuard-*` headers to prevent spoofing. Per-route timeout.
+  any inbound `X-RateGuard-*` headers to prevent spoofing. Sets `X-Real-IP` to
+  the computed client IP (inbound `Forwarded` is dropped); strips request
+  trailers named `X-RateGuard-*`, hop-by-hop or client-IP headers, the
+  `HTTP2-Settings` header and the dashboard's `rg_session` cookie. Per-route timeout.
   Upstream errors → `502 {"error":"bad_gateway"}`.
 - `Settings.MaxBodyBytes > 0` → `http.MaxBytesReader`.
 - Reserved paths (never proxied): `GET /_rlg/healthz` → 200; `GET /_rlg/readyz`
@@ -137,7 +150,7 @@ and logging with the proxy path; log `Source` is `"forward_auth"`.
   `route_id`, ignored in the Envoy form. The appended path goes through `cleanPath`
   (also applied by ServeHTTP before routing, so `..` cannot escape the prefix).
 - Responses: allowed → `200`, empty body, `RateLimit-*` headers,
-  `X-RateGuard-Consumer`; limited → `429` with the standard JSON body and headers;
+  `X-RateGuard-Consumer` (present with an empty value when anonymous); limited → `429` with the standard JSON body and headers;
   bad/missing key → 401; no route → 404; bad path → 400; limiter failure
   (fail-closed) → 503.
 - Leaky bucket: waits server-side like the proxy (global waiter cap applies).

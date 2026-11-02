@@ -1,5 +1,6 @@
 # Caddy forward_auth calling RateGuard's /_rlg/v1/auth.
-# forward_auth sends X-Forwarded-Method and X-Forwarded-Uri (plus the usual
+# forward_auth sets (overwrites) X-Forwarded-Method and X-Forwarded-Uri, so a
+# client cannot choose the route that is checked (plus the usual
 # X-Forwarded-For/-Host from reverse_proxy). Add Caddy's address to RateGuard's
 # Settings -> Trusted proxies so the client IP is read from X-Forwarded-For.
 # Directive reference: https://caddyserver.com/docs/caddyfile/directives/forward_auth

@@ -114,9 +114,22 @@ The header name is configurable in Settings (`APIKeyHeader`, default `X-API-Key`
 
 Change your clients' base URL from the upstream to RateGuard (`:8080`). Keep the
 same paths, so the route matches. RateGuard forwards the request with
-`X-Forwarded-For`, `X-Forwarded-Proto`, `X-Forwarded-Host` and
-`X-RateGuard-Consumer` (the consumer ID) set. Any inbound `X-RateGuard-*` headers
-are stripped.
+`X-Forwarded-For`, `X-Forwarded-Proto`, `X-Forwarded-Host`, `X-Real-IP` (the
+client IP RateGuard limited on) and `X-RateGuard-Consumer` (the consumer ID) set.
+Any inbound `X-RateGuard-*` headers are stripped.
+
+Route matching: hosts compare case-insensitively, ignoring a port and a trailing
+dot. **Paths are case-sensitive** (`/api/login` does not match `/API/LOGIN`), as are
+most upstreams; if yours treats paths case-insensitively, or strips `;params`
+(Java servlet containers), make sure the catch-all route's limits are acceptable
+for those variants too.
+
+WebSocket and other `Upgrade` requests are refused (`400 upgrade_not_allowed`)
+unless the route has **Allow upgrades** (`allow_upgrade: true`). An upgraded
+connection is counted as one request; concurrency policies hold their slot until
+it closes, and the route timeout (plus the data plane's 60 s read / 120 s write
+timeouts) bounds its lifetime. `h2c` upgrades are always
+refused.
 
 If RateGuard runs behind a load balancer or NGINX, add that proxy's address to
 Settings → **Trusted proxies** (CIDR or IP). Only then does RateGuard read the
@@ -277,6 +290,30 @@ Leaky-bucket policies make the endpoint wait server-side, exactly as the proxy d
 so keep the proxy's auth timeout above your longest shaping delay. Concurrency
 policies are skipped. Requests are logged with source `forward_auth`.
 
+### Trust requirement: the proxy must set the forwarded headers
+
+> **Important.** RateGuard decides on the request *as described by the headers*:
+> `X-Forwarded-Uri` (which wins over `X-Original-URI` / `X-Original-URL`),
+> `X-Forwarded-Method` and `X-Forwarded-Host`. Your proxy must **set (overwrite)**
+> these on every auth request. If it passes a client-supplied value through
+> unchanged, the client chooses which route and policies are evaluated, for
+> example presenting `/healthz` while actually calling `/admin`.
+
+All examples in this guide and on the dashboard's Integration page set them:
+NGINX and ingress-nginx with `proxy_set_header`, Caddy's `forward_auth` and
+Traefik's `ForwardAuth` overwrite them themselves (leave Traefik's
+`trustForwardHeader` off), and Envoy uses the appended-path form (do not add
+`x-forwarded-uri`, `x-forwarded-method` or `x-forwarded-host` to its
+`allowed_headers`). With ingress-nginx the `auth-snippet` is **required**: without
+it the controller forwards a client's own `X-Forwarded-Uri` unchanged, and that
+header takes precedence over the controller's `X-Original-URL`.
+
+On an allowed request the response always carries `X-RateGuard-Consumer`, empty
+for anonymous clients, so a proxy that copies it onto the upstream request
+(`auth_request_set`, `authResponseHeaders`, `copy_headers`,
+`allowed_upstream_headers`, `auth-response-headers`) overwrites anything the
+client sent. Copy it as the examples do; do not rely on upstreams ignoring it.
+
 ### Securing the endpoint
 
 By default the endpoint trusts whoever can reach it, so **expose it only to the
@@ -339,8 +376,9 @@ nginx.ingress.kubernetes.io/auth-response-headers: "X-RateGuard-Consumer, RateLi
 ```
 
 ingress-nginx sends `X-Original-URL` (a full URL), which RateGuard also accepts, but
-the `auth-snippet` makes the original request explicit. Snippet annotations must be
-enabled on the controller. Same mechanism as NGINX for the `429`
+the `auth-snippet` is required: it overwrites any client-supplied
+`X-Forwarded-Uri` / `-Method` / `-Host`, which RateGuard would otherwise prefer (see
+the trust requirement above). Snippet annotations must be enabled on the controller. Same mechanism as NGINX for the `429`
 (`?deny_status=403` plus snippets mapping 403 to 429). Stock `auth_request` turns any
 other non-2xx answer (400, 404, 503) into a `500`.
 

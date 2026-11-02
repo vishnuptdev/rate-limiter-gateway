@@ -18,7 +18,7 @@ traffic enters and where your services make their calls.
 | You already run NGINX / Traefik / Caddy / Envoy / ingress-nginx and want limits without moving traffic | Forward auth |
 | Limits depend on something only your code knows (a cost per operation, a tenant resolved from the body) | Check API |
 | Background jobs or service-to-service calls | Check API |
-| You need leaky-bucket shaping with the request held by the platform | Reverse proxy or forward auth (both wait server-side); the check API only reports `delay_ms` |
+| You need leaky-bucket shaping with the request held by the platform | Reverse proxy or forward auth (both wait server-side); the check API only reports `delay_ms`, which the caller must wait (the SDK examples do) |
 | You need concurrency limits | Reverse proxy only (the check API and forward auth have no completion signal) |
 | Language SDKs (Java, .NET, Ruby, PHP, Node, Python, Go) | Check API |
 
@@ -125,11 +125,22 @@ most upstreams; if yours treats paths case-insensitively, or strips `;params`
 for those variants too.
 
 WebSocket and other `Upgrade` requests are refused (`400 upgrade_not_allowed`)
-unless the route has **Allow upgrades** (`allow_upgrade: true`). An upgraded
-connection is counted as one request; concurrency policies hold their slot until
-it closes, and the route timeout (plus the data plane's 60 s read / 120 s write
-timeouts) bounds its lifetime. `h2c` upgrades are always
-refused.
+unless the route has **Allow WebSocket upgrades** (`allow_upgrade: true`). `h2c`
+upgrades are always refused. On such a route:
+
+- Each connection *open* is one request against the route's policies. To limit
+  how often a client may open WebSockets, attach a rate algorithm keyed as you
+  like, for example `token_bucket` with `limit: 10`, `window: 1m`, `burst: 5`,
+  `key_by: ["consumer"]`. Messages inside the tunnel are not metered.
+- The route **Timeout** bounds only the upgrade handshake. The tunnel is closed
+  after **Upgrade max duration** (`upgrade_max_duration`, default `1h`, at most
+  `24h`), so clients should reconnect. The data plane's server read/write
+  timeouts do not apply to a tunnel.
+- Concurrency policies cannot be used (their 60 s leases cannot represent a
+  long-lived tunnel), including as global policies; validation rejects them.
+
+Route timeouts above 120 s do not extend ordinary responses: the data plane's
+120 s write timeout ends them first.
 
 If RateGuard runs behind a load balancer or NGINX, add that proxy's address to
 Settings → **Trusted proxies** (CIDR or IP). Only then does RateGuard read the
@@ -320,8 +331,9 @@ By default the endpoint trusts whoever can reach it, so **expose it only to the
 proxy's network** (do not publish port 8080 for it publicly, or firewall it). To
 require a credential, turn on `Settings.ForwardAuthRequireToken` and make the proxy
 send `X-RateGuard-Auth-Token: <token>` with an API token of scope `check`; anything
-else gets `401`. Not every proxy can add a static header to its auth request
-(Traefik cannot), so choose network isolation there.
+else gets `401`. While the setting is off, the header is ignored rather than
+checked. Not every proxy can add a static header to its auth request (Traefik
+cannot), so choose network isolation there.
 
 ### NGINX `auth_request`
 

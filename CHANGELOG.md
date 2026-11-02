@@ -55,6 +55,26 @@ First public release.
   sliding-window log, and an allocation-light Redis client. The results and the
   machine they were measured on are in [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
 
+### Changed (behaviour to know when migrating)
+
+- **WebSocket and other `Upgrade` requests are refused by default** with
+  `400 upgrade_not_allowed`. Set `allow_upgrade: true` on a route to allow them
+  (dashboard: "Allow WebSocket upgrades"). An upgraded connection counts as one
+  request; the route `timeout` bounds only the handshake, and the tunnel is
+  closed after the new `upgrade_max_duration` (default 1h, at most 24h).
+  Concurrency policies cannot be used on such routes. `h2c` upgrades are always
+  refused.
+- **IPv6 clients are keyed per /64** by the `ip` key part and by the anonymous
+  fallback of the `consumer` key part. Tune it with the new
+  `ipv6_prefix_len` setting (32..128; 128 = per address).
+- **`X-Real-IP` is overwritten** with the client IP RateGuard limited on, and
+  underscore spellings of the client-IP headers (`X_Real_IP`,
+  `X_Forwarded_For`, ...) are removed before requests reach upstreams.
+- **The dashboard session cookie (`rg_session`) is stripped** from proxied
+  requests; other cookies pass through.
+- `cors_allow_origins` is reserved and not yet implemented; the dashboard no
+  longer shows it.
+
 ### Security
 
 - Strict CSP on the dashboard, `HttpOnly` `SameSite=Strict` session cookies,

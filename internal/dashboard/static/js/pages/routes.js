@@ -99,7 +99,7 @@ function openEditor(existing, policies, done, seed) {
       sectionTitle('Upstream'),
       h('div', { class: 'form-grid' },
         field({ label: 'Upstream URL', name: 'upstream', control: upstream, full: true, hint: 'Absolute http(s) URL the gateway proxies to.' }),
-        field({ label: 'Timeout', name: 'timeout', control: timeout, optional: true, hint: 'Go duration, e.g. 15s or 1m. Default 30s. Responses are also cut at the server’s 120s write timeout, so values above 2m have no effect (except for WebSocket handshakes).' })),
+        field({ label: 'Timeout', name: 'timeout', control: timeout, optional: true, hint: 'Go duration, e.g. 15s or 1m. Default 30s. Responses are also cut at the server’s 120s write timeout, so values above 2m have no effect.' })),
       strip, upgrade, upgradeMaxField),
     h('div', { class: 'form-section' },
       sectionTitle('Rate limiting & auth', 'Global policies from Settings run first, then these — in order. The first enforcing deny wins.'),

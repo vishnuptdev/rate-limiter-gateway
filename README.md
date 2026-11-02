@@ -68,6 +68,7 @@ Release binaries (linux, macOS, Windows; amd64 and arm64) and SHA-256 checksums 
 - **Policies, plans, consumers:** per-plan and per-consumer overrides; API keys are hashed (SHA-256) and shown once.
 - **Shadow mode** and **fail-open / fail-closed** behaviour per policy.
 - **Standard headers:** IETF `RateLimit-*` and `RateLimit-Policy`, optional legacy `X-RateLimit-*`.
+- **Safe defaults on the data plane:** WebSocket upgrades only on routes that opt in (`allow_upgrade`, with a per-route lifetime cap), `h2c` always refused, IPv6 clients limited per /64 by default, `X-Real-IP` / `X-Forwarded-*` rewritten and the dashboard session cookie stripped before requests reach upstreams.
 - **Admin dashboard:** overview charts, streaming logs (filters, CSV export), simulator, limits inspector (peek and reset), integration snippets, audit log, light and dark themes.
 - **Access control:** admin, editor and viewer roles, scoped API tokens (`admin`, `read`, `check`), CSRF protection, login lockout.
 - **Observability:** Prometheus metrics at `/metrics`; health at `/_rlg/healthz` and readiness at `/_rlg/readyz`.
@@ -247,10 +248,10 @@ Every rate-limited response carries headers from the most restrictive policy.
 
 | Header | When | Meaning |
 |---|---|---|
-| `RateLimit-Limit` | Every rate-limited response | Limit of the most restrictive policy |
+| `RateLimit-Limit` | Every rate-limited response | Limit of the most restrictive policy. For `token_bucket`, `gcra` and `leaky_bucket` this is the burst capacity (what `Remaining` counts down from), so it can differ from the rate in `RateLimit-Policy` |
 | `RateLimit-Remaining` | Every rate-limited response | Requests left in the current window |
 | `RateLimit-Reset` | Every rate-limited response | Seconds until the window resets |
-| `RateLimit-Policy` | Every rate-limited response | `<limit>;w=<window seconds>` |
+| `RateLimit-Policy` | Every rate-limited response | `<limit>;w=<window seconds>`: the policy's configured rate, e.g. `600;w=60` |
 | `Retry-After` | `429` responses | Seconds to wait, at least 1 |
 | `X-RateLimit-Limit`, `-Remaining`, `-Reset` | Legacy headers setting on | Legacy form; `-Reset` is a Unix timestamp |
 | `X-RateGuard-Route`, `X-RateGuard-Policy` | `ExposeDecision` setting on | Matched route and deciding policy |
@@ -311,7 +312,7 @@ Ideas, not promises:
 - Share users and API tokens between instances (today `auth.json` is per instance)
 - Persistent sessions so restarts do not log everyone out
 - A Helm chart and a published Grafana dashboard for the Prometheus metrics
-- Tracking for keys beyond the in-memory key cap, instead of letting overflow keys through untracked
+- Exact per-key tracking beyond the memory engine's key cap (today overflow keys share 4096 buckets and are still limited, but more coarsely)
 
 Have a different priority? Open a [feature request](https://github.com/vishnuptdev/rate-limiter-gateway/issues/new?template=feature_request.yml).
 

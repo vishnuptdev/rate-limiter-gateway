@@ -52,12 +52,23 @@ hop, and (c) an embedded admin dashboard.
 - `ip` key part: IPv6 addresses are masked to `Settings.IPv6PrefixLen` bits
   (32..128, 0 → 64), keyed as `2001:db8:1:2::/64`; IPv4 and IPv4-mapped
   addresses are used in full.
+- `consumer` key part: the consumer ID; for anonymous requests
+  `ip:<client IP>`, masked the same way as the `ip` part
+  (`ip:2001:db8:1:2::/64`).
 - Upgrades: `Upgrade: h2c` (with or without `Connection: Upgrade`) → `400
   {"error":"upgrade_not_allowed"}` on every route. Any other upgrade
   (`Connection: upgrade` + `Upgrade`) → same 400 unless `Route.AllowUpgrade`.
-  An allowed upgrade is evaluated as one request; concurrency slots are held
-  until the tunnel closes; the tunnel is bounded by the route timeout and the
-  server read/write timeouts.
+  An allowed upgrade is evaluated as one request. The route timeout bounds
+  only the handshake (until the upstream's `101`); the tunnel runs under a
+  context with `Route.UpgradeMaxDuration` (0 → 1h, ≤ 24h) and is closed when
+  it ends. The server's read/write deadlines are cleared on hijack and do not
+  bound tunnels. `store.Validate` rejects concurrency policies (route or
+  global) on `AllowUpgrade` routes, since 60 s leases cannot cover a tunnel.
+- Upstream request headers: inbound `X-RateGuard-*` (and `_` spellings) and
+  `HTTP2-Settings` are removed, as are `_` spellings of `X-Real-IP` /
+  `X-Forwarded-For` / `-Host` / `-Proto` / `Forwarded`; the `rg_session` cookie
+  is removed; `X-Forwarded-For`/`-Proto`/`-Host` and `X-Real-IP` are set by
+  RateGuard; request trailers with those names are dropped.
 - API key: header `Settings.APIKeyHeader` (default `X-API-Key`) or
   `Authorization: Bearer <key>`. Look up by sha256 hex → consumer. Revoked,
   expired, or disabled consumer = invalid. If route `RequireAPIKey` and key
@@ -161,7 +172,7 @@ and logging with the proxy path; log `Source` is `"forward_auth"`.
 ```go
 type Recorder interface { Record(model.LogEntry) }
 type TokenVerifier interface { Verify(token, scope string) bool }
-type Options struct { Engine ratelimit.Engine; Recorder Recorder; Tokens TokenVerifier; Logger *slog.Logger }
+type Options struct { Engine ratelimit.Engine; Recorder Recorder; Tokens TokenVerifier; Logger *slog.Logger; MaxShapingWaiters int /* 0 → 10000 */ }
 func New(o Options) *Gateway
 func (g *Gateway) Apply(s *model.Snapshot) error           // validate (store.Validate) + compile + atomic swap
 func (g *Gateway) Current() *model.Snapshot
@@ -285,12 +296,26 @@ Admin Go API (consumed by main):
 ```go
 type Runtime interface { Apply(*model.Snapshot) error; Current() *model.Snapshot; Simulate(context.Context, model.SimRequest) model.SimResult; EngineKey(policyID, composite string) string }
 type Telemetry interface { QueryLogs(model.LogQuery) []model.LogEntry; Subscribe(int) (<-chan model.LogEntry, func()); Timeseries(time.Duration, string) model.Timeseries; Overview() model.Overview; WritePrometheus(io.Writer) }
-type Options struct { DataDir string; Store store.ConfigStore; Runtime Runtime; Telemetry Telemetry; Engine ratelimit.Engine; StaticFS fs.FS; Logger *slog.Logger; Version, InstanceID, DataPlaneAddr, AdminAddr string; CookieSecure bool; MetricsPublic bool; BootstrapPassword string }
+type Options struct { DataDir string; Store store.ConfigStore; Runtime Runtime; Telemetry Telemetry; Engine ratelimit.Engine; StaticFS fs.FS; Logger *slog.Logger; Version, InstanceID, DataPlaneAddr, AdminAddr string; CookieSecure bool; MetricsPublic bool; BootstrapPassword string
+  Validate func(*model.Snapshot) error // nil → store.Validate
+  TrustProxyHeaders bool }             // honour X-Forwarded-For/-Proto/-Host on the admin plane
 func New(o Options) (*Server, error)   // loads auth.json, bootstraps admin
 func (s *Server) Handler() http.Handler
 func (s *Server) Tokens() gateway-compatible TokenVerifier (method Verify(token, scope string) bool)
 func (s *Server) Start(ctx context.Context) // launches store.Watch loop
 ```
+
+## Wiring (`cmd/rateguard`)
+
+Configuration is environment-only (full table with defaults in README.md):
+`RLG_LISTEN`, `RLG_ADMIN_LISTEN`, `RLG_DATA_DIR`, `RLG_ENGINE`, `RLG_STORE`,
+`RLG_REDIS_ADDR`, `RLG_REDIS_PASSWORD`, `RLG_REDIS_DB`, `RLG_REDIS_TLS`,
+`RLG_ADMIN_PASSWORD`, `RLG_COOKIE_SECURE`, `RLG_METRICS_PUBLIC`, `RLG_TLS_CERT`,
+`RLG_TLS_KEY`, `RLG_DEMO`, `RLG_LOG_LEVEL`, `RLG_ADMIN_TRUST_PROXY` (→ admin
+`TrustProxyHeaders`), `RLG_LOG_CAPACITY` (→ telemetry `LogCapacity`) and
+`RLG_MAX_SHAPING_WAITERS` (→ gateway `MaxShapingWaiters`). Data-plane server
+timeouts: `ReadHeaderTimeout` 10 s, `ReadTimeout` 60 s, `WriteTimeout` 120 s
+(the latter also caps ordinary responses, whatever the route timeout).
 
 ## Dashboard (`internal/dashboard/static`)
 

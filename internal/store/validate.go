@@ -267,3 +267,7 @@ func validProxy(s string) bool {
 	_, err := netip.ParseAddr(s)
 	return err == nil
 }
+
+// ProblemsJSON exposes the problem list to packages (admin) that render it
+// without importing store's concrete types.
+func (e *ValidationError) ProblemsJSON() any { return e.Problems }

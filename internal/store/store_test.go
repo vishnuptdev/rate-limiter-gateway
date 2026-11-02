@@ -93,6 +93,24 @@ func TestValidate(t *testing.T) {
 		{"ipv6 prefix 31", func(s *model.Snapshot) { s.Settings.IPv6PrefixLen = 31 }, []string{"settings.ipv6_prefix_len"}},
 		{"ipv6 prefix 129", func(s *model.Snapshot) { s.Settings.IPv6PrefixLen = 129 }, []string{"settings.ipv6_prefix_len"}},
 		{"ipv6 prefix negative", func(s *model.Snapshot) { s.Settings.IPv6PrefixLen = -1 }, []string{"settings.ipv6_prefix_len"}},
+		{"upgrade with concurrency policy", func(s *model.Snapshot) {
+			s.Routes[0].AllowUpgrade = true
+			s.Routes[0].PolicyIDs = []string{"p1", "conc"}
+		}, []string{"routes[0].policy_ids[1]"}},
+		{"concurrency without upgrade ok", func(s *model.Snapshot) { s.Routes[0].PolicyIDs = []string{"p1", "conc"} }, nil},
+		{"upgrade with global concurrency policy", func(s *model.Snapshot) {
+			s.Routes[0].AllowUpgrade = true
+			s.Settings.GlobalPolicyIDs = []string{"p1", "conc"}
+		}, []string{"routes[0].allow_upgrade"}},
+		{"upgrade max 24h ok", func(s *model.Snapshot) {
+			s.Routes[0].AllowUpgrade = true
+			s.Routes[0].UpgradeMaxDuration = model.Duration(24 * time.Hour)
+		}, nil},
+		{"upgrade max over 24h", func(s *model.Snapshot) {
+			s.Routes[0].AllowUpgrade = true
+			s.Routes[0].UpgradeMaxDuration = model.Duration(25 * time.Hour)
+		}, []string{"routes[0].upgrade_max_duration"}},
+		{"upgrade max negative", func(s *model.Snapshot) { s.Routes[0].UpgradeMaxDuration = model.Duration(-time.Second) }, []string{"routes[0].upgrade_max_duration"}},
 		{"multiple problems", func(s *model.Snapshot) { s.Policies[0].Limit = 0; s.Routes[0].Upstream = "x" }, []string{"policies[0].limit", "routes[0].upstream"}},
 	}
 	for _, tc := range cases {

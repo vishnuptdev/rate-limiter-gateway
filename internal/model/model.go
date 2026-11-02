@@ -125,8 +125,14 @@ type Route struct {
 	// AllowUpgrade lets HTTP/1.1 Upgrade requests (WebSocket) through this
 	// route. Off by default: an upgraded connection is a raw tunnel that is
 	// rate limited only once, as the single upgrade request. h2c is always
-	// rejected.
+	// rejected. Concurrency policies cannot be combined with it (their 60s
+	// leases cannot represent long tunnels).
 	AllowUpgrade bool `json:"allow_upgrade,omitempty"`
+	// UpgradeMaxDuration is the lifetime cap of an upgraded (WebSocket)
+	// tunnel; the tunnel is closed when it is reached. 0 => 1h, at most 24h.
+	// Only meaningful with AllowUpgrade: Timeout then bounds the upgrade
+	// handshake only.
+	UpgradeMaxDuration Duration `json:"upgrade_max_duration,omitempty"`
 }
 
 // LimitOverride replaces a policy's numbers for a plan or consumer.
@@ -179,7 +185,7 @@ type Settings struct {
 	TrustedProxies   []string `json:"trusted_proxies"`    // CIDRs whose X-Forwarded-For is trusted
 	GlobalPolicyIDs  []string `json:"global_policy_ids"`  // applied to every route, before route policies
 	LegacyHeaders    bool     `json:"legacy_headers"`     // also emit X-RateLimit-* headers
-	ExposeDecision   bool     `json:"expose_decision"`    // emit X-RLG-Policy / X-RLG-Route headers
+	ExposeDecision   bool     `json:"expose_decision"`    // emit X-RateGuard-Policy / X-RateGuard-Route headers
 	MaxBodyBytes     int64    `json:"max_body_bytes"`     // 0 => unlimited
 	LogSampleAllowed float64  `json:"log_sample_allowed"` // 0..1 fraction of allowed requests logged (limited/errors always logged)
 	CheckAPIEnabled  bool     `json:"check_api_enabled"`  // enable POST /_rlg/v1/check on the data plane
@@ -190,7 +196,7 @@ type Settings struct {
 	// ForwardAuthRequireToken makes the endpoint demand
 	// X-RateGuard-Auth-Token with a "check"-scoped token.
 	ForwardAuthRequireToken bool     `json:"forward_auth_require_token"`
-	CORSAllowOrigins        []string `json:"cors_allow_origins,omitempty"` // for the data plane, optional
+	CORSAllowOrigins        []string `json:"cors_allow_origins,omitempty"` // reserved, not yet implemented (ignored)
 	// IPv6PrefixLen is how many leading bits of an IPv6 client address the
 	// "ip" key part uses (32..128; 0 => 64), so a client cannot rotate
 	// through its /64 to get a fresh bucket per address. IPv4 (and

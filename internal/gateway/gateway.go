@@ -354,6 +354,7 @@ type reqState struct {
 	upstreamDur time.Duration
 	upstreamErr error
 	started     time.Time
+	handshake   *time.Timer // upgrade requests: cancels at the route timeout until a 101 arrives
 }
 
 type ctxKey struct{}
@@ -552,7 +553,22 @@ func (g *Gateway) serveProxy(w http.ResponseWriter, r *http.Request, cleaned str
 	}
 
 	// Per-request copy so StripPrefix never mutates the caller's URL.
-	ctx, cancelUp := context.WithTimeout(context.WithValue(r.Context(), ctxKey{}, st), route.timeout)
+	var (
+		ctx      context.Context
+		cancelUp context.CancelFunc
+	)
+	if route.upgradeMax > 0 && upgradeType(r.Header) != "" {
+		// ReverseProxy closes a hijacked tunnel when the request context
+		// ends, and the server's read/write deadlines are cleared on
+		// hijack. So the context carries the tunnel's lifetime cap, and the
+		// route timeout bounds only the handshake: modifyResponse stops
+		// the handshake timer once the upstream answers 101.
+		ctx, cancelUp = context.WithTimeout(context.WithValue(r.Context(), ctxKey{}, st), route.upgradeMax)
+		st.handshake = time.AfterFunc(route.timeout, cancelUp)
+		defer st.handshake.Stop()
+	} else {
+		ctx, cancelUp = context.WithTimeout(context.WithValue(r.Context(), ctxKey{}, st), route.timeout)
+	}
 	defer cancelUp()
 	r2 := r.WithContext(ctx)
 	u := *r.URL
@@ -934,6 +950,9 @@ func modifyResponse(resp *http.Response) error {
 		return nil
 	}
 	st.upstreamDur = time.Since(st.started)
+	if st.handshake != nil && resp.StatusCode == http.StatusSwitchingProtocols {
+		st.handshake.Stop() // the tunnel now runs until the upgrade max duration
+	}
 	h := resp.Header
 	for k := range h {
 		// Our headers are authoritative; also never leak X-RateGuard-* from upstream.

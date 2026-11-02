@@ -226,17 +226,18 @@ func rawUpgrade(t *testing.T, gw *httptest.Server, path, upHdr string, extra ...
 	return resp, c, br
 }
 
-// SA4: h2c is always refused; other upgrades need Route.AllowUpgrade, count
-// as one request, and hold concurrency slots for the tunnel's lifetime.
+// SA4: h2c is always refused; other upgrades need Route.AllowUpgrade and
+// count as one request. (Concurrency policies cannot be combined with
+// AllowUpgrade; store.Validate rejects that.)
 func TestHardenUpgrade(t *testing.T) {
 	addr, upgrades := upgradeBackend(t)
 	e := newEnv(t, func(s *model.Snapshot) {
 		s.Policies = []model.Policy{
 			pol("ip1", model.AlgoFixedWindow, 1000, "ip"),
-			pol("conc", model.AlgoConcurrency, 1, "ip"),
+			pol("open1", model.AlgoFixedWindow, 2, "ip"),
 		}
 		closed := route("closed", "http://"+addr, "/closed", "ip1")
-		ws := route("ws", "http://"+addr, "/ws", "ip1", "conc")
+		ws := route("ws", "http://"+addr, "/ws", "ip1", "open1")
 		ws.AllowUpgrade = true
 		s.Routes = []model.Route{closed, ws}
 	})
@@ -294,26 +295,83 @@ func TestHardenUpgrade(t *testing.T) {
 		}
 		io.Copy(io.Discard, r2.Body)
 	}
-	if got := e.eng.callCount() - before; got != 2 { // ip1 + conc, once
+	if got := e.eng.callCount() - before; got != 2 { // ip1 + open1, once
 		t.Fatalf("engine calls for one upgrade = %d, want 2", got)
 	}
-	// The concurrency slot is held while the tunnel is open...
-	resp, _, _ = rawUpgrade(t, gw, "/ws", "websocket")
-	if resp.StatusCode != http.StatusTooManyRequests {
-		t.Fatalf("second concurrent upgrade: %s", resp.Status)
-	}
-	// ...and released when it closes.
 	c1.Close()
-	deadline := time.Now().Add(5 * time.Second)
-	for e.eng.usedOf("conc:127.0.0.1") != 0 {
-		if time.Now().After(deadline) {
-			t.Fatal("concurrency slot not released after the tunnel closed")
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
+	// Connection opens are rate limited like requests (open1: 2 per minute).
 	resp, _, _ = rawUpgrade(t, gw, "/ws", "websocket")
 	if resp.StatusCode != http.StatusSwitchingProtocols {
-		t.Fatalf("upgrade after release: %s", resp.Status)
+		t.Fatalf("second upgrade: %s", resp.Status)
+	}
+	resp, _, _ = rawUpgrade(t, gw, "/ws", "websocket")
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("third upgrade within the limit window: %s", resp.Status)
+	}
+}
+
+// I4: an upgraded tunnel outlives the route timeout (which bounds only the
+// handshake) and is closed at Route.UpgradeMaxDuration.
+func TestHardenUpgradeMaxDuration(t *testing.T) {
+	addr, _ := upgradeBackend(t)
+	// A backend that accepts the upgrade request but never answers it.
+	hang, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { hang.Close() })
+	go func() {
+		for {
+			c, err := hang.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) { defer c.Close(); io.Copy(io.Discard, c) }(c)
+		}
+	}()
+	const routeTimeout, maxDur = 150 * time.Millisecond, 700 * time.Millisecond
+	e := newEnv(t, func(s *model.Snapshot) {
+		ws := route("ws", "http://"+addr, "/ws")
+		slow := route("slow", "http://"+hang.Addr().String(), "/slow")
+		for _, r := range []*model.Route{&ws, &slow} {
+			r.AllowUpgrade = true
+			r.Timeout = model.Duration(routeTimeout)
+			r.UpgradeMaxDuration = model.Duration(maxDur)
+		}
+		s.Routes = []model.Route{ws, slow}
+	})
+	gw := httptest.NewServer(e.g)
+	defer gw.Close()
+
+	// The handshake is bounded by the route timeout.
+	t0 := time.Now()
+	resp, _, _ := rawUpgrade(t, gw, "/slow", "websocket")
+	if resp.StatusCode == http.StatusSwitchingProtocols || time.Since(t0) > maxDur {
+		t.Fatalf("hung handshake: %s after %v", resp.Status, time.Since(t0))
+	}
+
+	t0 = time.Now()
+	resp, c, br := rawUpgrade(t, gw, "/ws", "websocket")
+	if resp.StatusCode != http.StatusSwitchingProtocols {
+		t.Fatalf("upgrade: %s", resp.Status)
+	}
+	c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	// Past the route timeout the tunnel still works.
+	time.Sleep(2 * routeTimeout)
+	fmt.Fprint(c, "GET /alive HTTP/1.1\r\nHost: x\r\n\r\n")
+	r2, err := http.ReadResponse(br, nil)
+	if err != nil {
+		t.Fatalf("tunnel closed at the route timeout (after %v): %v", time.Since(t0), err)
+	}
+	io.Copy(io.Discard, r2.Body)
+	// At the upgrade max duration the gateway closes it.
+	if _, err := br.ReadByte(); err == nil {
+		t.Fatal("unexpected data on the tunnel")
+	} else if ne, ok := err.(net.Error); ok && ne.Timeout() {
+		t.Fatal("tunnel not closed at the upgrade max duration")
+	}
+	if d := time.Since(t0); d < maxDur-50*time.Millisecond || d > maxDur+2*time.Second {
+		t.Fatalf("tunnel closed after %v, want ~%v", d, maxDur)
 	}
 }
 

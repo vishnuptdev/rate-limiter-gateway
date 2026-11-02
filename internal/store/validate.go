@@ -76,6 +76,7 @@ func Validate(s *model.Snapshot) error {
 	}
 	v := &validator{}
 	policyIDs := map[string]bool{}
+	concurrency := map[string]bool{} // policy IDs using the concurrency algorithm
 	planIDs := map[string]bool{}
 
 	checkID := func(field, id string, seen map[string]bool) {
@@ -101,6 +102,9 @@ func Validate(s *model.Snapshot) error {
 		f := fmt.Sprintf("policies[%d]", i)
 		checkID(f+".id", p.ID, policyIDs)
 		checkName(f+".name", p.Name)
+		if p.Algorithm == model.AlgoConcurrency {
+			concurrency[p.ID] = true
+		}
 		known := false
 		for _, a := range model.Algorithms {
 			if a == p.Algorithm {
@@ -172,12 +176,25 @@ func Validate(s *model.Snapshot) error {
 			}
 		}
 		for j, id := range r.PolicyIDs {
-			if !policyIDs[id] {
+			switch {
+			case !policyIDs[id]:
 				v.add(fmt.Sprintf("%s.policy_ids[%d]", f, j), "unknown policy %q", id)
+			case r.AllowUpgrade && concurrency[id]:
+				v.add(fmt.Sprintf("%s.policy_ids[%d]", f, j), concurrencyUpgradeMsg, id)
+			}
+		}
+		if r.AllowUpgrade {
+			for _, id := range s.Settings.GlobalPolicyIDs {
+				if concurrency[id] {
+					v.add(f+".allow_upgrade", "global policy %q uses the concurrency algorithm, which cannot be combined with WebSocket upgrades (leases expire after 60s); remove it from settings.global_policy_ids or turn upgrades off", id)
+				}
 			}
 		}
 		if r.Timeout.D() < 0 {
 			v.add(f+".timeout", "must be >= 0")
+		}
+		if d := r.UpgradeMaxDuration.D(); d < 0 || d > maxUpgradeDuration {
+			v.add(f+".upgrade_max_duration", "must be between 0 and 24h (0 = 1h)")
 		}
 	}
 
@@ -236,6 +253,13 @@ func Validate(s *model.Snapshot) error {
 	}
 	return &ValidationError{Problems: v.probs}
 }
+
+// maxUpgradeDuration caps Route.UpgradeMaxDuration.
+const maxUpgradeDuration = 24 * time.Hour
+
+const concurrencyUpgradeMsg = "policy %q uses the concurrency algorithm, which cannot be combined with allow_upgrade: " +
+	"concurrency leases expire after 60s and cannot represent long-lived WebSocket tunnels. " +
+	"Limit connection opens with a rate algorithm (e.g. token_bucket or sliding_window) instead"
 
 func (v *validator) overrides(field string, m map[string]model.LimitOverride, policies map[string]bool) {
 	for id, o := range m {

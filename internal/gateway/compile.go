@@ -51,6 +51,9 @@ type croute struct {
 	target   *url.URL
 	proxy    *httputil.ReverseProxy
 	timeout  time.Duration
+	// upgradeMax bounds an upgraded tunnel's lifetime (AllowUpgrade only);
+	// timeout then bounds just the handshake.
+	upgradeMax time.Duration
 }
 
 type cconsumer struct {
@@ -202,6 +205,11 @@ func (g *Gateway) compile(s *model.Snapshot) *compiled {
 		cr := &croute{r: r, methods: map[string]bool{}, timeout: r.Timeout.D()}
 		if cr.timeout <= 0 {
 			cr.timeout = 30 * time.Second
+		}
+		if r.AllowUpgrade {
+			if cr.upgradeMax = r.UpgradeMaxDuration.D(); cr.upgradeMax <= 0 {
+				cr.upgradeMax = time.Hour
+			}
 		}
 		if h := trimHostDot(strings.ToLower(r.Match.Host)); h != "" {
 			if strings.HasPrefix(h, "*.") {

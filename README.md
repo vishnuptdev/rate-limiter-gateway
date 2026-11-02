@@ -1,115 +1,190 @@
-# rate-limiter-gateway
+# RateGuard
 
-A reverse-proxy API gateway with pluggable rate-limiting strategies
-(token bucket, sliding window) and pluggable backends (in-memory,
-Redis-backed distributed). No AI/LLM involved — this is a rate limiter and
-a proxy.
+**Rate limiting for your APIs, in a single Go binary.**
 
-See `NOTES.md` for environment restrictions and the reasoning behind
-non-obvious decisions (in particular, why there's a hand-rolled Redis
-client instead of a third-party one, and why Lua/EVAL is used).
+RateGuard is a rate-limiting reverse proxy and decision service with an embedded
+admin dashboard. Put it in front of your APIs so it enforces limits on every
+request, or call its check API from your own services when you do not want an
+extra proxy hop. Manage routes, policies, plans, consumers and API keys from a
+web UI, with an audit trail and live traffic visibility.
+
+It is one binary with no database, no build step for the UI, and no third-party
+Go dependencies (standard library only).
+
+> Screenshots: _placeholder — dashboard screenshots (Overview, Live Logs,
+> Simulator, Limits inspector) will be added here._
+
+## Features
+
+- **Reverse proxy mode.** Route by host, path prefix and method. Allowed requests
+  are forwarded to your upstream; denied requests get `429` with `Retry-After`.
+- **Check API mode.** `POST /_rlg/v1/check` returns an allow/deny decision and
+  rate-limit headers, for services that enforce limits themselves.
+- **Five algorithms.** Token bucket, sliding window, sliding-window counter,
+  fixed window, and concurrency (in-flight requests).
+- **Policies, plans and consumers.** Limits are attached to routes through
+  policies. Plans and per-consumer overrides adjust them per customer. Keys are
+  hashed at rest and shown once.
+- **Shadow mode.** Run a policy in observe-only mode and see what it would block
+  before you enforce it.
+- **Distributed limits.** The Redis engine runs each algorithm as an atomic Lua
+  script, so several RateGuard instances share one set of counters.
+- **Fail-open or fail-closed.** Choose per policy what happens when the limiter
+  backend is unavailable.
+- **Standard headers.** IETF `RateLimit-*` headers, with optional legacy
+  `X-RateLimit-*` headers.
+- **Admin dashboard.** Overview with live charts, streaming logs with filters,
+  a request simulator, a limits inspector (peek and reset), an integration page
+  with copy-paste snippets, audit log, and settings.
+- **Access control.** Roles (admin, editor, viewer), scoped API tokens, session
+  cookies with CSRF protection, login lockout, and an audit log of every change.
+- **Observability.** Prometheus metrics at `/metrics`.
+
+## 60-second quickstart
+
+### With Docker
+
+```bash
+docker build -t rateguard .
+docker run --rm -p 8080:8080 -p 9000:9000 \
+  -e RLG_DEMO=true \
+  -e RLG_ADMIN_PASSWORD='choose-a-long-password' \
+  -v rateguard-data:/data \
+  rateguard
+```
+
+### With the binary
+
+```bash
+go build -o rateguard ./cmd/rateguard
+RLG_DEMO=true RLG_ADMIN_PASSWORD='choose-a-long-password' ./rateguard
+```
+
+Then:
+
+1. Open the dashboard at `http://localhost:9000` and log in as `admin`.
+2. Demo mode seeds a route, policies, a plan, a consumer and a dummy upstream.
+   The Routes page shows the demo route. Send requests to the data plane on
+   `:8080` and watch them appear in Live Logs.
+3. Use the Simulator to test a request against the policies without sending it.
+
+`RLG_ADMIN_PASSWORD` must be at least 12 characters. If you leave it unset on
+first start, RateGuard generates a password and prints it once to stderr.
 
 ## Architecture
 
 ```
-cmd/gateway/main.go         entrypoint: config, dummy backend, gateway listener
-internal/config/            env-var configuration
-internal/limiter/           TokenBucket, SlidingWindow (in-memory)
-                             RedisTokenBucket, RedisSlidingWindow (distributed)
-internal/redisclient/       hand-rolled RESP2 client (no dependencies)
-internal/proxy/             rate-limit middleware + reverse proxy + /metrics/usage
+                 clients (API keys)                       your services
+                        │                                       │
+                        ▼                                       ▼
+        ┌───────────────────────────────┐        POST /_rlg/v1/check
+        │  :8080  data plane            │◀───────(Bearer token, scope check)
+        │  routing · auth · policies    │
+        │  proxy · headers · check API  │──────▶ upstream APIs
+        └───────────────┬───────────────┘
+                        │ counters (atomic)
+                        ▼
+        ┌───────────────────────────────┐
+        │  limiter engine               │   RLG_ENGINE=memory | redis
+        │  memory  or  Redis (Lua)      │◀──── shared across instances
+        └───────────────────────────────┘
+
+        ┌───────────────────────────────┐
+        │  :9000  admin + dashboard     │   REST API · auth · audit log
+        │  /metrics (Prometheus)        │──────▶ config store
+        └───────────────────────────────┘        RLG_STORE=file | redis
 ```
 
-Request flow: client → `Gateway.Handler` (extract `X-API-Key` →
-`Limiter.Allow(key)` → 429 + `Retry-After` if denied, else forward via
-`httputil.ReverseProxy`) → dummy upstream backend (a second real HTTP
-listener on `127.0.0.1:9090`, started by the same binary for a
-self-contained demo).
+Config changes made in the dashboard are validated, applied to the running data
+plane, and then saved to the config store. With `RLG_STORE=redis`, every
+instance watches the config version and picks up changes.
 
-## Strategy comparison
+## Choosing an algorithm
 
-| | Token bucket | Sliding window |
+| Algorithm | Behaviour | Memory per key | Pick it when |
+|---|---|---|---|
+| `token_bucket` | Refills at a steady rate up to a burst capacity | O(1) | You want a steady average rate and can tolerate short bursts |
+| `sliding_window` | Exact count of requests in any trailing window (log) | O(requests in window) | You need an exact "N requests per window" contract |
+| `sliding_window_counter` | Weighted blend of the current and previous fixed windows (approximate) | O(1) | You want close-to-exact limits at high volume |
+| `fixed_window` | One counter per calendar-aligned window | O(1) | You want the simplest option and accept up to 2x burst across a window boundary |
+| `concurrency` | Caps in-flight requests; the slot is released when the proxied response completes | O(in-flight) | You want to protect an upstream from simultaneous load (proxy mode only; the check API skips it) |
+
+Token bucket and sliding window are the two you will reach for most often.
+Token bucket gives burst tolerance: up to `burst` requests go through at once,
+then the bucket refills. Sliding window gives a hard cap on every trailing window,
+with no burst allowance.
+
+In Redis mode each algorithm runs as a single Lua script. Redis executes a script
+atomically, so two RateGuard instances cannot both read "9 tokens left" and both
+spend the last one. Scripts use the Redis server clock (`TIME`), so instances with
+skewed clocks still agree on the counters.
+
+## Response headers
+
+Every rate-limited response carries headers from the most restrictive policy
+(the one with the lowest remaining count).
+
+| Header | When | Meaning |
 |---|---|---|
-| Burst tolerance | Yes — up to `burst` requests instantly, then refills at `rate`/sec | No — hard cap of `limit` requests in any trailing `window` |
-| Memory (in-process) | O(1) per key | O(requests in window) per key |
-| Good for | "steady average rate with occasional bursts" APIs | "exactly N requests per minute" contracts |
-| Redis storage | 1 hash per key (`tokens`, `ts`) | 1 sorted set per key (timestamp → request id) |
+| `RateLimit-Limit` | Every rate-limited response | Limit of the most restrictive policy |
+| `RateLimit-Remaining` | Every rate-limited response | Requests left in the current window |
+| `RateLimit-Reset` | Every rate-limited response | Seconds until the window resets (rounded up) |
+| `RateLimit-Policy` | Every rate-limited response | `<limit>;w=<window seconds>` |
+| `Retry-After` | `429` responses | Seconds to wait, at least 1 |
+| `X-RateLimit-Limit`, `-Remaining`, `-Reset` | When `LegacyHeaders` is on | Legacy form; `-Reset` is a Unix timestamp |
+| `X-RateGuard-Route`, `X-RateGuard-Policy` | When `ExposeDecision` is on | Matched route and deciding policy |
+| `X-RateGuard-Consumer` | Upstream requests only | Consumer ID. Inbound `X-RateGuard-*` headers are stripped, so clients cannot spoof them |
 
-Both are implemented as **atomic Redis Lua scripts** in the distributed
-mode — see `NOTES.md` for why that matters under concurrency.
+A `429` body looks like this:
 
-## Setup
-
-Requires Go 1.22+. Redis is optional (only needed for
-`RLG_LIMITER_BACKEND=redis`); this environment already has it running via
-`redis-server --daemonize yes`.
-
-```bash
-cd rate-limiter-gateway
-go run ./cmd/gateway
-# gateway on :8080 (configurable), dummy backend on 127.0.0.1:9090
-```
-
-Try it:
-
-```bash
-curl -H "X-API-Key: demo" http://localhost:8080/hello        # 200, proxied
-curl -H "X-API-Key: demo" http://localhost:8080/hello        # ... repeat past burst ...
-# eventually:
-# HTTP/1.1 429 Too Many Requests
-# Retry-After: 1
-# {"error":"rate limit exceeded","retry_after_seconds":1}
-
-curl http://localhost:8080/metrics/usage                      # usage for every key seen
-curl http://localhost:8080/metrics/usage?key=demo              # usage for one key
+```json
+{"error":"rate_limited","message":"Rate limit exceeded","policy":"api-per-minute","limit":100,"remaining":0,"retry_after_s":12,"reset_s":12}
 ```
 
 ## Configuration reference
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `RLG_PORT` | `8080` | gateway listen port |
-| `RLG_BACKEND_URL` | `http://127.0.0.1:9090` | upstream the proxy forwards to |
-| `RLG_STRATEGY` | `token_bucket` | `token_bucket` or `sliding_window` |
-| `RLG_LIMITER_BACKEND` | `memory` | `memory` or `redis` |
-| `RLG_REDIS_ADDR` | `127.0.0.1:6379` | used when `RLG_LIMITER_BACKEND=redis` |
-| `RLG_RATE` | `5` | token bucket: tokens/sec refill rate |
-| `RLG_BURST` | `10` | token bucket: max tokens |
-| `RLG_LIMIT` | `10` | sliding window: max requests per window |
-| `RLG_WINDOW` | `10s` | sliding window: window size (Go duration syntax) |
+| `RLG_LISTEN` | `:8080` | Data plane listen address |
+| `RLG_ADMIN_LISTEN` | `:9000` | Admin API and dashboard listen address |
+| `RLG_DATA_DIR` | `./data` | Local state: `auth.json`, `audit.jsonl`, and `config.json` in file-store mode |
+| `RLG_ENGINE` | — | Limiter engine: `memory` (per process) or `redis` (shared) |
+| `RLG_STORE` | — | Config store: `file` (local JSON) or `redis` (shared, versioned) |
+| `RLG_REDIS_ADDR` | `127.0.0.1:6379` | Redis address, used when `redis` is the engine or store |
+| `RLG_REDIS_PASSWORD` | unset | Redis AUTH password |
+| `RLG_REDIS_DB` | unset | Redis database number |
+| `RLG_REDIS_TLS` | unset | Connect to Redis over TLS when `true` |
+| `RLG_ADMIN_PASSWORD` | unset | Password for the bootstrap `admin` user, used only when no users exist yet |
+| `RLG_COOKIE_SECURE` | unset | Force the `Secure` attribute on session cookies (always set under TLS) |
+| `RLG_METRICS_PUBLIC` | unset | Serve `/metrics` without authentication when `true` |
+| `RLG_TLS_CERT`, `RLG_TLS_KEY` | unset | TLS certificate and key for the admin listener |
+| `RLG_DEMO` | unset | Seed a demo configuration and a dummy upstream when `true` |
+| `RLG_LOG_LEVEL` | — | Log verbosity |
 
-Example running two gateway instances sharing a limit via Redis:
+Set `RLG_ENGINE=redis` and `RLG_STORE=redis` on every instance that should
+share limits and configuration. Give each instance its own `RLG_DATA_DIR`. See
+[docs/SECURITY.md](docs/SECURITY.md) for the caveats on per-instance user data.
 
-```bash
-RLG_LIMITER_BACKEND=redis RLG_PORT=8080 go run ./cmd/gateway &
-RLG_LIMITER_BACKEND=redis RLG_PORT=8081 RLG_BACKEND_URL=http://127.0.0.1:9090 go run ./cmd/gateway &
-# both instances now share the same per-key limit via Redis
-```
-
-(Note: both processes also each start their own dummy backend on
-`:9090`; in a real deployment the backend would be a separate service, not
-embedded in the gateway binary — it's embedded here purely so the demo is
-one command. In this two-instance-on-one-machine example only the first
-`:9090` bind succeeds, which is fine since both gateways forward to it.)
-
-## Verification
+## Build, test, run
 
 ```bash
-go build ./...
-go vet ./...
-go test ./... -race -v
+make build     # go build -o rateguard ./cmd/rateguard
+make test      # go test -race ./...
+make lint      # go vet ./... and gofmt check
+make run       # run with ./data as the data directory
+make demo      # run with RLG_DEMO=true
+make docker    # build the container image
 ```
 
-At time of writing: **19 tests, 19 passed, 0 failed** (`go test ./...
--race`). See `NOTES.md` for the full breakdown and what the multi-instance
-Redis tests specifically prove.
+## Documentation
 
-## What's real vs. simplified
-
-- Real Redis, real atomic Lua scripts, real separate `Limiter` instances
-  proven to share state in tests (not simulated with goroutines in one
-  instance).
-- Real reverse proxy hop to a real second HTTP listener.
-- The in-memory backend is exactly what it says: per-process only, not
-  distributed. It's the explicit non-distributed comparison point, not a
-  disguised version of the Redis mode.
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): product spec and contracts
+  (behaviour, endpoints, headers, storage)
+- [docs/INTEGRATION.md](docs/INTEGRATION.md): reverse proxy, check API, and
+  combined integration, step by step
+- [docs/SECURITY.md](docs/SECURITY.md): threat model, auth model, hardening
+  checklist
+- [examples/](examples/): Node/Express, Python/FastAPI, Go `net/http`, NGINX
+  and Kubernetes examples
+- [docker-compose.yml](docker-compose.yml): two RateGuard instances sharing Redis,
+  with a demo upstream

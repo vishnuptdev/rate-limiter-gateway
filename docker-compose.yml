@@ -1,0 +1,75 @@
+# RateGuard: two instances sharing one Redis, plus a demo upstream.
+#
+# Create a .env file next to this file (never commit it):
+#   REDIS_PASSWORD=<long random string>
+#   RLG_ADMIN_PASSWORD=<at least 12 characters>
+#
+# Then:  docker compose up --build
+#   instance 1: data plane http://localhost:8080   admin http://localhost:9000
+#   instance 2: data plane http://localhost:8081   admin http://localhost:9001
+#
+# Both instances use RLG_ENGINE=redis and RLG_STORE=redis, so limits and config
+# are shared. Each instance keeps its own data volume for auth.json and
+# audit.jsonl; see docs/SECURITY.md before creating users or check tokens.
+
+x-rateguard-base: &rateguard-base
+  build: .
+  image: rateguard:latest
+  restart: unless-stopped
+  depends_on:
+    redis:
+      condition: service_healthy
+  environment:
+    RLG_ENGINE: redis
+    RLG_STORE: redis
+    RLG_REDIS_ADDR: redis:6379
+    RLG_REDIS_PASSWORD: ${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}
+    RLG_ADMIN_PASSWORD: ${RLG_ADMIN_PASSWORD:?set RLG_ADMIN_PASSWORD in .env}
+    RLG_LOG_LEVEL: info
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  read_only: true
+
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}", "--appendonly", "yes"]
+    environment:
+      # redis-cli reads REDISCLI_AUTH, so the password is not on the command line.
+      REDISCLI_AUTH: ${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    volumes:
+      - redis-data:/data
+
+  rateguard-1:
+    <<: *rateguard-base
+    ports:
+      - "8080:8080"
+      - "9000:9000"
+    volumes:
+      - rateguard-1-data:/data
+
+  rateguard-2:
+    <<: *rateguard-base
+    ports:
+      - "8081:8080"
+      - "9001:9000"
+    volumes:
+      - rateguard-2-data:/data
+
+  # Demo upstream. In the dashboard, point a route at http://whoami:80.
+  whoami:
+    image: traefik/whoami
+    restart: unless-stopped
+
+volumes:
+  redis-data:
+  rateguard-1-data:
+  rateguard-2-data:

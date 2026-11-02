@@ -225,6 +225,9 @@ func Validate(s *model.Snapshot) error {
 	if !(st.LogSampleAllowed >= 0 && st.LogSampleAllowed <= 1) { // also rejects NaN
 		v.add("settings.log_sample_allowed", "must be between 0 and 1")
 	}
+	if n := st.IPv6PrefixLen; n != 0 && (n < 32 || n > 128) {
+		v.add("settings.ipv6_prefix_len", "must be between 32 and 128 (0 = 64)")
+	}
 
 	v.shaping(s)
 

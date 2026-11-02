@@ -87,6 +87,12 @@ func TestValidate(t *testing.T) {
 		{"sample < 0", func(s *model.Snapshot) { s.Settings.LogSampleAllowed = -0.1 }, []string{"settings.log_sample_allowed"}},
 		{"bad api header", func(s *model.Snapshot) { s.Settings.APIKeyHeader = "bad header" }, []string{"settings.api_key_header"}},
 		{"negative max body", func(s *model.Snapshot) { s.Settings.MaxBodyBytes = -1 }, []string{"settings.max_body_bytes"}},
+		{"ipv6 prefix 0 ok", func(s *model.Snapshot) { s.Settings.IPv6PrefixLen = 0 }, nil},
+		{"ipv6 prefix 32 ok", func(s *model.Snapshot) { s.Settings.IPv6PrefixLen = 32 }, nil},
+		{"ipv6 prefix 128 ok", func(s *model.Snapshot) { s.Settings.IPv6PrefixLen = 128 }, nil},
+		{"ipv6 prefix 31", func(s *model.Snapshot) { s.Settings.IPv6PrefixLen = 31 }, []string{"settings.ipv6_prefix_len"}},
+		{"ipv6 prefix 129", func(s *model.Snapshot) { s.Settings.IPv6PrefixLen = 129 }, []string{"settings.ipv6_prefix_len"}},
+		{"ipv6 prefix negative", func(s *model.Snapshot) { s.Settings.IPv6PrefixLen = -1 }, []string{"settings.ipv6_prefix_len"}},
 		{"multiple problems", func(s *model.Snapshot) { s.Policies[0].Limit = 0; s.Routes[0].Upstream = "x" }, []string{"policies[0].limit", "routes[0].upstream"}},
 	}
 	for _, tc := range cases {

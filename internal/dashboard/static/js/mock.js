@@ -283,6 +283,7 @@ export async function handle(method, url, body) {
     if (!admin) return fail(403, 'forbidden', 'Only admins can change settings');
     const probs = [];
     if (!body.api_key_header) probs.push({ field: 'settings.api_key_header', message: 'Header name is required' });
+    if (body.ipv6_prefix_len && (body.ipv6_prefix_len < 32 || body.ipv6_prefix_len > 128)) probs.push({ field: 'settings.ipv6_prefix_len', message: 'Must be between 32 and 128' });
     if (body.log_sample_allowed < 0 || body.log_sample_allowed > 1) probs.push({ field: 'settings.log_sample_allowed', message: 'Must be between 0 and 1' });
     (body.trusted_proxies || []).forEach((p, i) => { if (!/^[0-9a-f:.]+(\/\d+)?$/i.test(p)) probs.push({ field: `settings.trusted_proxies[${i}]`, message: `“${p}” is not an IP or CIDR` }); });
     if (probs.length) return fail(422, 'validation_failed', 'Validation failed', probs);

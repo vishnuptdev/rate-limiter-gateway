@@ -79,7 +79,7 @@ export function buildSnapshot(now = Date.now()) {
   });
   return {
     version: 148, updated_at: iso(now - 3600e3), policies, routes, plans, consumers,
-    settings: { api_key_header: 'X-API-Key', trusted_proxies: ['10.0.0.0/8', '172.16.0.0/12'], global_policy_ids: ['global-ceiling', 'tenant-header'], legacy_headers: true, expose_decision: false, max_body_bytes: 10485760, log_sample_allowed: 1, check_api_enabled: true, cors_allow_origins: [] },
+    settings: { api_key_header: 'X-API-Key', trusted_proxies: ['10.0.0.0/8', '172.16.0.0/12'], global_policy_ids: ['global-ceiling', 'tenant-header'], legacy_headers: true, expose_decision: false, max_body_bytes: 10485760, log_sample_allowed: 1, check_api_enabled: true, cors_allow_origins: [], ipv6_prefix_len: 64 },
   };
 }
 

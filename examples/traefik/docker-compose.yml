@@ -1,0 +1,37 @@
+# Traefik v2/v3 ForwardAuth middleware calling RateGuard's /_rlg/v1/auth.
+# Traefik sends X-Forwarded-Method/-Uri/-Host/-For itself. Add Traefik's
+# address (the Docker network subnet) to RateGuard's Settings -> Trusted
+# proxies so the client IP is read from X-Forwarded-For.
+# Option names: https://doc.traefik.io/traefik/middlewares/http/forwardauth/
+#
+# A limited request gets RateGuard's 429 response (with Retry-After and
+# RateLimit-*) relayed to the client by Traefik.
+#
+# The auth endpoint is unauthenticated by default: do not publish RateGuard's
+# port. (Do not enable "Forward auth require token" with Traefik: ForwardAuth
+# cannot add a static header to the auth request, so rely on the network.)
+
+services:
+  traefik:
+    image: traefik:v3.1
+    command:
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --entrypoints.web.address=:80
+    ports: ["80:80"]
+    volumes: ["/var/run/docker.sock:/var/run/docker.sock:ro"]
+
+  rateguard:
+    image: rateguard:latest   # your RateGuard image; share Redis as in the main docker-compose.yml
+    expose: ["8080"]
+
+  whoami:
+    image: traefik/whoami
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.whoami.rule=Host(`api.example.com`)
+      - traefik.http.routers.whoami.entrypoints=web
+      - traefik.http.routers.whoami.middlewares=rateguard
+      - traefik.http.middlewares.rateguard.forwardauth.address=http://rateguard:8080/_rlg/v1/auth
+      # Headers copied from the auth response onto the request sent upstream.
+      - traefik.http.middlewares.rateguard.forwardauth.authResponseHeaders=X-RateGuard-Consumer,RateLimit-Limit,RateLimit-Remaining,RateLimit-Reset,RateLimit-Policy

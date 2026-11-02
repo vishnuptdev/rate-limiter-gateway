@@ -1,13 +1,26 @@
 # Integrating RateGuard
 
-RateGuard can enforce limits in three ways. Pick the one that fits where your
+RateGuard can enforce limits in four ways. Pick the one that fits where your
 traffic enters and where your services make their calls.
 
 | Mode | Where RateGuard sits | Who enforces | Best for |
 |---|---|---|---|
 | **1. Reverse proxy** | In the request path, in front of your upstream | RateGuard returns `429` itself | Public APIs, or any HTTP service you can route through a proxy |
 | **2. Check API** | Beside your service; your code calls it | Your service acts on the decision | Services that already own their request path, or that need a custom cost per operation |
-| **3. Both** | Proxy for external traffic, check API for internal calls | Both | Mixed estates: public API plus internal or background work |
+| **3. Forward auth** | Beside an existing proxy or ingress that calls it per request | The proxy relays RateGuard's `200` / `429` | NGINX, Traefik, Caddy, Envoy, ingress-nginx: no code changes, no traffic through RateGuard |
+| **4. Both** | Proxy for external traffic, check API for internal calls | Both | Mixed estates: public API plus internal or background work |
+
+### Which mode should I use?
+
+| Your situation | Use |
+|---|---|
+| You can point clients (or a DNS name) at RateGuard | Reverse proxy |
+| You already run NGINX / Traefik / Caddy / Envoy / ingress-nginx and want limits without moving traffic | Forward auth |
+| Limits depend on something only your code knows (a cost per operation, a tenant resolved from the body) | Check API |
+| Background jobs or service-to-service calls | Check API |
+| You need leaky-bucket shaping with the request held by the platform | Reverse proxy or forward auth (both wait server-side); the check API only reports `delay_ms` |
+| You need concurrency limits | Reverse proxy only (the check API and forward auth have no completion signal) |
+| Language SDKs (Java, .NET, Ruby, PHP, Node, Python, Go) | Check API |
 
 Examples for each language are under [`examples/`](../examples/). The dashboard's
 **Integration** page also shows copy-paste snippets pre-filled with your
@@ -222,7 +235,128 @@ for operations where unlimited traffic is worse than an outage.
 
 ---
 
-## Mode 3: Both
+## Mode 3: Forward auth
+
+The proxy or ingress in front of your service asks RateGuard about every request
+before forwarding it. RateGuard never proxies: it answers `200` (let it through) or
+`429` / `401` / `404`, and the proxy relays that answer.
+
+```
+client -> NGINX / Traefik / Caddy / Envoy -> your service
+              |   ^
+              v   | 200 + headers, or 429
+           RateGuard  /_rlg/v1/auth
+```
+
+### Endpoint contract
+
+`/_rlg/v1/auth`, any method, on the data plane (`:8080`). Enabled by default
+(turn off with `Settings.ForwardAuthDisabled`).
+
+| Input | Source |
+|---|---|
+| Original method | `X-Forwarded-Method`, else `X-Original-Method`, else `GET` |
+| Original path and query | `X-Forwarded-Uri`, else `X-Original-URI`, else `X-Original-URL` (a full URL, also giving the host), else `/`. Normalised exactly like proxy-mode paths, so encoded slashes, backslashes and NUL give `400` and `..` is resolved |
+| Host | `X-Forwarded-Host`, else `Host` |
+| Client IP | `X-Forwarded-For` / `X-Real-IP` **only if the calling proxy is in Trusted proxies**; otherwise the TCP peer |
+| API key | The usual headers (`X-API-Key` or `Authorization: Bearer`) of the forwarded request |
+| Route | `?route_id=<id>` on the auth URL if given, else matched from method/host/path as in proxy mode |
+| Limited status | `?deny_status=401`, `403` or `429` on the auth URL (default 429) |
+| Envoy form | `/_rlg/v1/auth/<original path>?<query>` with the original method; used when no forwarded-URI header is present. `route_id` is ignored in this form |
+
+| Result | Response |
+|---|---|
+| Allowed | `200`, empty body, `RateLimit-*` headers and `X-RateGuard-Consumer` |
+| Limited | `429`, the standard JSON body, `Retry-After` and `RateLimit-*` |
+| Missing or invalid API key | `401` |
+| No route | `404` |
+| Invalid path | `400` |
+| Limiter backend down | `503` |
+
+Leaky-bucket policies make the endpoint wait server-side, exactly as the proxy does,
+so keep the proxy's auth timeout above your longest shaping delay. Concurrency
+policies are skipped. Requests are logged with source `forward_auth`.
+
+### Securing the endpoint
+
+By default the endpoint trusts whoever can reach it, so **expose it only to the
+proxy's network** (do not publish port 8080 for it publicly, or firewall it). To
+require a credential, turn on `Settings.ForwardAuthRequireToken` and make the proxy
+send `X-RateGuard-Auth-Token: <token>` with an API token of scope `check`; anything
+else gets `401`. Not every proxy can add a static header to its auth request
+(Traefik cannot), so choose network isolation there.
+
+### NGINX `auth_request`
+
+[`examples/nginx/auth_request.conf`](../examples/nginx/auth_request.conf). Copy the
+`location = /_rateguard_auth` block and add `auth_request /_rateguard_auth;` to the
+protected location. Stock NGINX passes only `401` and `403` from the auth
+subrequest to the client, so the example calls
+`/_rlg/v1/auth?deny_status=403` and maps it with `error_page 403 = @ratelimited;`
+to a real `429` (the named location returns 429 and copies `Retry-After`).
+
+`deny_status` (`401`, `403` or `429`; default `429`) sets the status of limited
+responses only; the headers and body are unchanged. Like `route_id`, it is an
+operator setting on the auth URL and is ignored in the Envoy appended-path form.
+
+### Traefik `ForwardAuth`
+
+[`examples/traefik/docker-compose.yml`](../examples/traefik/docker-compose.yml):
+
+```yaml
+- traefik.http.middlewares.rateguard.forwardauth.address=http://rateguard:8080/_rlg/v1/auth
+- traefik.http.middlewares.rateguard.forwardauth.authResponseHeaders=X-RateGuard-Consumer,RateLimit-Limit,RateLimit-Remaining,RateLimit-Reset
+```
+
+### Caddy `forward_auth`
+
+[`examples/caddy/Caddyfile`](../examples/caddy/Caddyfile):
+
+```
+forward_auth rateguard:8080 {
+	uri /_rlg/v1/auth
+	copy_headers X-RateGuard-Consumer RateLimit-Limit RateLimit-Remaining RateLimit-Reset
+}
+```
+
+### Envoy `ext_authz` (HTTP)
+
+[`examples/envoy/ext_authz.yaml`](../examples/envoy/ext_authz.yaml). Set
+`http_service.path_prefix: /_rlg/v1/auth` and forward `x-api-key` and
+`x-forwarded-for` in `allowed_headers`.
+
+### Kubernetes ingress-nginx
+
+[`examples/k8s/ingress-nginx-auth.yaml`](../examples/k8s/ingress-nginx-auth.yaml):
+
+```yaml
+nginx.ingress.kubernetes.io/auth-url: "http://rateguard.default.svc.cluster.local:8080/_rlg/v1/auth?deny_status=403"
+nginx.ingress.kubernetes.io/auth-snippet: |
+  proxy_set_header X-Forwarded-Method $request_method;
+  proxy_set_header X-Forwarded-Uri $request_uri;
+  proxy_set_header X-Forwarded-Host $host;
+nginx.ingress.kubernetes.io/auth-response-headers: "X-RateGuard-Consumer, RateLimit-Limit, RateLimit-Remaining, RateLimit-Reset"
+```
+
+ingress-nginx sends `X-Original-URL` (a full URL), which RateGuard also accepts, but
+the `auth-snippet` makes the original request explicit. Snippet annotations must be
+enabled on the controller. Same mechanism as NGINX for the `429`
+(`?deny_status=403` plus snippets mapping 403 to 429). Stock `auth_request` turns any
+other non-2xx answer (400, 404, 503) into a `500`.
+
+### Language SDK examples (check API)
+
+Fail-open, 50 ms timeout, `Authorization: Bearer <token>`, headers copied from the
+response. Each is one file with a usage comment at the top:
+
+- Java / Spring: [`examples/java/RateGuardFilter.java`](../examples/java/RateGuardFilter.java)
+- C# / ASP.NET Core: [`examples/dotnet/RateGuardMiddleware.cs`](../examples/dotnet/RateGuardMiddleware.cs)
+- Ruby / Rack: [`examples/ruby/rate_guard.rb`](../examples/ruby/rate_guard.rb)
+- PHP / PSR-15: [`examples/php/RateGuardMiddleware.php`](../examples/php/RateGuardMiddleware.php)
+
+---
+
+## Mode 4: Both
 
 Use the proxy for external traffic and the check API for calls your own services
 make. The two modes share the same policies, limits and consumers, so one
@@ -247,10 +381,10 @@ and `RLG_ADMIN_PASSWORD`, then `docker compose up --build`. Point a route at
 
 ### NGINX in front
 
-[`examples/nginx/auth_request.conf`](../examples/nginx/auth_request.conf) shows
+[`examples/nginx/reverse_proxy.conf`](../examples/nginx/reverse_proxy.conf) shows
 NGINX proxying to two RateGuard instances. Use this pattern when NGINX already
-terminates TLS. Note that `auth_request` does not fit the check API; put RateGuard
-in the proxy path instead, as the file explains.
+terminates TLS. To keep traffic off RateGuard, use forward auth instead
+([`auth_request.conf`](../examples/nginx/auth_request.conf), Mode 3).
 
 ### Kubernetes
 

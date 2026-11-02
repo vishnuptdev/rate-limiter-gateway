@@ -170,15 +170,22 @@ type Consumer struct {
 
 // Settings are gateway-wide knobs.
 type Settings struct {
-	APIKeyHeader     string   `json:"api_key_header"`               // default "X-API-Key"; "Authorization: Bearer" also accepted
-	TrustedProxies   []string `json:"trusted_proxies"`              // CIDRs whose X-Forwarded-For is trusted
-	GlobalPolicyIDs  []string `json:"global_policy_ids"`            // applied to every route, before route policies
-	LegacyHeaders    bool     `json:"legacy_headers"`               // also emit X-RateLimit-* headers
-	ExposeDecision   bool     `json:"expose_decision"`              // emit X-RLG-Policy / X-RLG-Route headers
-	MaxBodyBytes     int64    `json:"max_body_bytes"`               // 0 => unlimited
-	LogSampleAllowed float64  `json:"log_sample_allowed"`           // 0..1 fraction of allowed requests logged (limited/errors always logged)
-	CheckAPIEnabled  bool     `json:"check_api_enabled"`            // enable POST /_rlg/v1/check on the data plane
-	CORSAllowOrigins []string `json:"cors_allow_origins,omitempty"` // for the data plane, optional
+	APIKeyHeader     string   `json:"api_key_header"`     // default "X-API-Key"; "Authorization: Bearer" also accepted
+	TrustedProxies   []string `json:"trusted_proxies"`    // CIDRs whose X-Forwarded-For is trusted
+	GlobalPolicyIDs  []string `json:"global_policy_ids"`  // applied to every route, before route policies
+	LegacyHeaders    bool     `json:"legacy_headers"`     // also emit X-RateLimit-* headers
+	ExposeDecision   bool     `json:"expose_decision"`    // emit X-RLG-Policy / X-RLG-Route headers
+	MaxBodyBytes     int64    `json:"max_body_bytes"`     // 0 => unlimited
+	LogSampleAllowed float64  `json:"log_sample_allowed"` // 0..1 fraction of allowed requests logged (limited/errors always logged)
+	CheckAPIEnabled  bool     `json:"check_api_enabled"`  // enable POST /_rlg/v1/check on the data plane
+	// ForwardAuthDisabled turns /_rlg/v1/auth off (zero value = enabled, so a
+	// client unaware of the field cannot disable it by accident). The endpoint
+	// serves NGINX auth_request, Traefik ForwardAuth, Caddy forward_auth, etc.
+	ForwardAuthDisabled bool `json:"forward_auth_disabled"`
+	// ForwardAuthRequireToken makes the endpoint demand
+	// X-RateGuard-Auth-Token with a "check"-scoped token.
+	ForwardAuthRequireToken bool     `json:"forward_auth_require_token"`
+	CORSAllowOrigins        []string `json:"cors_allow_origins,omitempty"` // for the data plane, optional
 }
 
 func DefaultSettings() Settings {

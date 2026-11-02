@@ -1,0 +1,52 @@
+# ingress-nginx using RateGuard as the auth-url (forward auth). ingress-nginx
+# sends X-Original-URL (a full URL) and X-Auth-Request-Redirect with the auth
+# subrequest. RateGuard reads X-Original-URL, but the auth-snippet below also
+# sets X-Forwarded-Method/-Uri/-Host explicitly, which is the most reliable.
+# Snippet annotations must be enabled on the controller
+# (allow-snippet-annotations: "true"; newer controllers also restrict snippet
+# risk levels via annotations-risk-level). Add the ingress controller's pod/node CIDR to RateGuard's
+# Settings -> Trusted proxies so client IPs come from X-Forwarded-For.
+# Annotation reference:
+# https://kubernetes.github.io/ingress-nginx/user-guide/nginx-configuration/annotations/#external-authentication
+#
+# Getting a real 429: ingress-nginx (like NGINX auth_request) only passes 401
+# and 403 from the auth service to the client. The auth-url below uses
+# ?deny_status=403 so limited requests come back as 403, and the snippets turn
+# that into a 429 with a JSON body. Snippet annotations must be allowed by your
+# controller (allow-snippet-annotations); if they are disabled, limited clients
+# see 403 instead. Retry-After is not copied here.
+#
+# Keep the RateGuard Service cluster-internal (the endpoint is unauthenticated
+# by default) or enable Settings -> Forward auth require token.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: api
+  annotations:
+    nginx.ingress.kubernetes.io/auth-url: "http://rateguard.default.svc.cluster.local:8080/_rlg/v1/auth?deny_status=403"
+    nginx.ingress.kubernetes.io/auth-snippet: |
+      proxy_set_header X-Forwarded-Method $request_method;
+      proxy_set_header X-Forwarded-Uri $request_uri;
+      proxy_set_header X-Forwarded-Host $host;
+    nginx.ingress.kubernetes.io/configuration-snippet: |
+      error_page 403 = @ratelimited;
+    nginx.ingress.kubernetes.io/server-snippet: |
+      location @ratelimited {
+        default_type application/json;
+        return 429 '{"error":"rate_limited","message":"Rate limit exceeded"}';
+      }
+    # Copied from the auth response onto the request sent to the backend.
+    nginx.ingress.kubernetes.io/auth-response-headers: "X-RateGuard-Consumer, RateLimit-Limit, RateLimit-Remaining, RateLimit-Reset"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: api.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: your-service
+                port:
+                  number: 80

@@ -82,7 +82,7 @@ hop, and (c) an embedded admin dashboard.
 - `Settings.MaxBodyBytes > 0` → `http.MaxBytesReader`.
 - Reserved paths (never proxied): `GET /_rlg/healthz` → 200; `GET /_rlg/readyz`
   → 200 if config loaded & engine healthy else 503; `POST /_rlg/v1/check`
-  (if `CheckAPIEnabled`).
+  (if `CheckAPIEnabled`); `/_rlg/v1/auth`, any method (unless `ForwardAuthDisabled`; see below).
 - Every request produces one `model.LogEntry` passed to a `Recorder`
   (`Record(model.LogEntry)`); allowed requests sampled by `LogSampleAllowed`.
   `RateKey` must never contain a raw API key.
@@ -112,6 +112,36 @@ always (even when limited):
 Concurrency policies are skipped by the check API (no completion signal).
 `delay_ms` is the largest leaky-bucket queue delay among enforcing policies; the
 check API reports it and never sleeps (the caller holds the request).
+
+### Forward-auth endpoint — `/_rlg/v1/auth`
+
+For reverse proxies that delegate the decision (NGINX `auth_request`, Traefik
+`ForwardAuth`, Caddy `forward_auth`, Envoy `ext_authz` HTTP, ingress-nginx
+`auth-url`). Never proxies. Shares route matching, key extraction, `evaluate`,
+`writeLimited`/`rateHeaders`, leaky-bucket waiting (`reserveShaper`/`waitShaping`)
+and logging with the proxy path; log `Source` is `"forward_auth"`.
+
+- Caller auth: none by default (restrict by network). If
+  `Settings.ForwardAuthRequireToken`, header `X-RateGuard-Auth-Token` must verify
+  with `TokenVerifier` scope `"check"`, else 401.
+- Original request: method from `X-Forwarded-Method`/`X-Original-Method` (default
+  GET); URI from `X-Forwarded-Uri`/`X-Original-URI` (default `/`), normalised
+  with `cleanPath` (invalid → 400); host from `X-Forwarded-Host` else `Host`;
+  client IP via the trusted-proxy rules (`X-Forwarded-For`, else `X-Real-IP`, only
+  honoured when `RemoteAddr` is trusted; otherwise `RemoteAddr`).
+- Envoy form: `/_rlg/v1/auth/<orig path>?<query>` with the original method is
+  accepted when no forwarded-URI header is present; `route_id` is ignored there.
+- Route: `?route_id=` if given (unknown → 404), else matched normally.
+- `?deny_status=401|403|429` (default 429, other → 400) sets the limited status
+  (NGINX auth_request only relays 401/403); headers/body unchanged. Like
+  `route_id`, ignored in the Envoy form. The appended path goes through `cleanPath`
+  (also applied by ServeHTTP before routing, so `..` cannot escape the prefix).
+- Responses: allowed → `200`, empty body, `RateLimit-*` headers,
+  `X-RateGuard-Consumer`; limited → `429` with the standard JSON body and headers;
+  bad/missing key → 401; no route → 404; bad path → 400; limiter failure
+  (fail-closed) → 503.
+- Leaky bucket: waits server-side like the proxy (global waiter cap applies).
+  Concurrency policies are skipped.
 
 ### Gateway Go API (consumed by admin + main)
 

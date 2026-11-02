@@ -106,3 +106,18 @@ README: hero line + badges (CI, Go Report Card, license, Go version, release), s
 (docker run + binary + `RLG_DEMO=true`), feature list, 7-algorithm table, integration modes, real benchmark numbers from docs/PERFORMANCE.md,
 architecture diagram, config reference (all env vars with defaults), FAQ, roadmap, contributing, license. Honest claims only (no fake numbers, no
 false comparisons with other products).
+
+### Task 11: Forward-auth endpoint + more SDK examples (integrate with anything)
+Dirs: `internal/gateway/`, `examples/`, `docs/INTEGRATION.md`.
+- `GET|POST|... /_rlg/v1/auth` (any method) on the data plane: the standard "forward auth / auth_request" contract used by
+  NGINX `auth_request`, Traefik `ForwardAuth`, Caddy `forward_auth`, Envoy `ext_authz` (HTTP mode), Kong/ingress-nginx `auth-url`.
+  Original request is read from `X-Forwarded-Method`/`X-Original-Method`, `X-Forwarded-Uri`/`X-Original-URI`, `X-Forwarded-Host`/Host,
+  client IP via trusted-proxy rules (the proxy calling it must be in TrustedProxies, else use RemoteAddr), API key from the usual headers.
+  Route matched as in proxy mode (or `?route_id=`). Allowed -> 200 empty body + RateLimit-* headers + `X-RateGuard-Consumer`;
+  limited -> 429 + Retry-After + RateLimit-*; unauthorized -> 401; no route -> 404. Never proxies. Same logging (Source "forward_auth").
+  Auth of the caller: optional `Settings.ForwardAuthToken`-free design — protect by network (document) AND support `Authorization: Bearer`
+  check-scoped token when `?token_required=1`... (keep simple: if the request carries `X-RateGuard-Auth-Token`, verify with scope check;
+  setting `Settings.ForwardAuthRequireToken bool` makes it mandatory). Leaky-bucket delay: return 429-free, wait server-side like proxy.
+- Examples: nginx (auth_request, real), traefik (ForwardAuth middleware labels), caddy (forward_auth), envoy (ext_authz http), k8s ingress-nginx annotations,
+  plus SDK snippets for Java (Spring OncePerRequestFilter), C#/.NET (middleware), Ruby (Rack), PHP (PSR-15 middleware) using the check API, fail-open, 50ms timeout.
+- INTEGRATION.md: decision table "which mode should I use", per-platform copy-paste sections.

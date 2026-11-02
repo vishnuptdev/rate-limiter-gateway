@@ -47,9 +47,11 @@ const (
 	AlgoSlidingWindowCounter Algorithm = "sliding_window_counter" // approximate sliding window, O(1) memory (Cloudflare-style)
 	AlgoFixedWindow          Algorithm = "fixed_window"           // at most Limit per aligned Window
 	AlgoConcurrency          Algorithm = "concurrency"            // at most Limit in-flight requests (released on completion)
+	AlgoGCRA                 Algorithm = "gcra"                   // generic cell rate algorithm: one timestamp per key, smooth rate with Burst tolerance
+	AlgoLeakyBucket          Algorithm = "leaky_bucket"           // traffic shaping: requests queue (are delayed) and drain at Limit/Window
 )
 
-var Algorithms = []Algorithm{AlgoTokenBucket, AlgoSlidingWindow, AlgoSlidingWindowCounter, AlgoFixedWindow, AlgoConcurrency}
+var Algorithms = []Algorithm{AlgoTokenBucket, AlgoSlidingWindow, AlgoSlidingWindowCounter, AlgoFixedWindow, AlgoConcurrency, AlgoGCRA, AlgoLeakyBucket}
 
 // Mode controls what happens when a policy's limit is exceeded.
 type Mode string

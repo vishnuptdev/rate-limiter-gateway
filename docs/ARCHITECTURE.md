@@ -30,7 +30,7 @@ hop, and (c) an embedded admin dashboard.
 | Package | Responsibility |
 |---|---|
 | `internal/model` | Config + telemetry + simulator types (done) |
-| `internal/ratelimit` | `Engine` interface (done) + `Memory` and `Redis` engines, all 5 algorithms |
+| `internal/ratelimit` | `Engine` interface (done) + `Memory` and `Redis` engines, all 7 algorithms (token bucket, sliding window log, sliding window counter, fixed window, concurrency, GCRA, leaky bucket) |
 | `internal/redisclient` | Hand-rolled RESP2 client (exists) — add AUTH/SELECT, timeouts, EVALSHA cache |
 | `internal/store` | `ConfigStore` (done) + `File` and `Redis` implementations, `Validate` |
 | `internal/gateway` | Data plane: routing, auth, key extraction, policy evaluation, proxy, headers, check API, simulator |
@@ -61,6 +61,11 @@ hop, and (c) an embedded admin dashboard.
   deny? **No** — stop at the first enforce deny (don't burn other buckets).
   Shadow denies are recorded and continue.
 - Concurrency policies: release slot when the proxied response completes.
+- Leaky-bucket policies: an allowed decision carries `Decision.Delay`; the proxy
+  waits that long (timer + `select` on the client context, capped at the policy
+  window) before forwarding. A client abort while queued logs decision `error` /
+  `client_closed` (HTTP 499) and does not proxy; held concurrency slots are still
+  released. GCRA and leaky bucket share one state value (TAT) and one Lua script.
 - Backend error: policy `FailMode` open → skip policy; closed → `503 {"error":"limiter_unavailable"}`.
 - Response headers on every rate-limited route (from the *most restrictive*
   policy = lowest remaining): IETF `RateLimit-Limit`, `RateLimit-Remaining`,
@@ -99,12 +104,14 @@ always (even when limited):
 
 ```json
 {"allowed":false,"decision":"limited","route_id":"...","consumer_id":"...",
- "policy_id":"...","limit":100,"remaining":0,"reset_s":12,"retry_after_s":12,
+ "policy_id":"...","limit":100,"remaining":0,"reset_s":12,"retry_after_s":12,"delay_ms":0,
  "headers":{"RateLimit-Limit":"100","RateLimit-Remaining":"0","RateLimit-Reset":"12","Retry-After":"12"},
  "results":[{"policy_id":"...","allowed":false,"limit":100,"remaining":0,"shadow":false}]}
 ```
 
 Concurrency policies are skipped by the check API (no completion signal).
+`delay_ms` is the largest leaky-bucket queue delay among enforcing policies; the
+check API reports it and never sleeps (the caller holds the request).
 
 ### Gateway Go API (consumed by admin + main)
 

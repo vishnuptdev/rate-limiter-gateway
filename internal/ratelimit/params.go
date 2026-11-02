@@ -37,7 +37,7 @@ func normalize(p Params) (Params, error) {
 	switch p.Algorithm {
 	case model.AlgoConcurrency:
 		// Window and Burst are ignored.
-	case model.AlgoTokenBucket:
+	case model.AlgoTokenBucket, model.AlgoGCRA, model.AlgoLeakyBucket:
 		if p.Burst < 0 {
 			return p, fmt.Errorf("%w: burst must be >= 0", ErrInvalidParams)
 		}
@@ -56,9 +56,10 @@ func normalize(p Params) (Params, error) {
 }
 
 // decisionLimit is the Limit reported in a Decision: the burst capacity for
-// the token bucket, Limit otherwise.
+// the token bucket, GCRA and leaky bucket, Limit otherwise.
 func decisionLimit(p Params) int {
-	if p.Algorithm == model.AlgoTokenBucket {
+	switch p.Algorithm {
+	case model.AlgoTokenBucket, model.AlgoGCRA, model.AlgoLeakyBucket:
 		return p.Burst
 	}
 	return p.Limit

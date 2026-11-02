@@ -4,6 +4,7 @@ import (
 	"context"
 	"hash/fnv"
 	"log/slog"
+	"math"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -89,6 +90,9 @@ type entry struct {
 	// token bucket
 	tokens float64
 	lastNs int64
+
+	// GCRA / leaky bucket: theoretical arrival time in unix ns (0 = fresh)
+	tat int64
 
 	// sliding window log
 	log []logRec
@@ -387,6 +391,10 @@ func (e *entry) eval(p Params, now int64, consume bool) Decision {
 		return e.slidingCounter(p, now, consume)
 	case model.AlgoFixedWindow:
 		return e.fixedWindow(p, now, consume)
+	case model.AlgoGCRA:
+		return e.gcra(p, now, consume, false)
+	case model.AlgoLeakyBucket:
+		return e.gcra(p, now, consume, true)
 	default:
 		return e.concurrency(p, now, consume)
 	}
@@ -585,6 +593,65 @@ func (e *entry) concurrency(p Params, now int64, consume bool) Decision {
 	}
 	if !allowed {
 		d.RetryAfter = concurrencyRetryHint
+	}
+	return d
+}
+
+// gcra implements both the Generic Cell Rate Algorithm and the leaky bucket
+// shaper; they share one piece of state, the theoretical arrival time (TAT):
+// the instant at which the virtual queue of admitted requests has drained.
+//
+//	T   = Window/Limit            emission interval (time per unit)
+//	cap = Burst*T                 queue capacity expressed as drain time
+//	B   = max(TAT-now, 0)         current backlog
+//
+// A request of Cost n is admitted iff B + n*T <= cap (for n=1 this is the
+// classic "TAT-now <= tau" with tau = T*(Burst-1)); then TAT = now + B + n*T.
+// A request with n > Burst can never fit. GCRA admits immediately
+// (Delay 0): the backlog is only a debt that limits later arrivals.
+// Leaky bucket (shape=true) instead reports Delay = B, the time the request
+// waits in the queue before it may proceed; the queue holds at most Burst
+// units, so Delay never exceeds (Burst-1)*T.
+//
+// Remaining is the number of further units that would be admitted right now
+// (GCRA: burst credit; leaky bucket: free queue slots). RetryAfter, when
+// denied, is the time until the request would fit (or the time to fully
+// drain when n > Burst). ResetAfter is the time to fully drain.
+//
+// The entry is idle (losslessly evictable) exactly when TAT <= now, which
+// is indistinguishable from a fresh key, so idleNs tracks the backlog.
+// State is a single int64 guarded by the shard lock (not a lock-free CAS)
+// to stay consistent with the other algorithms and the eviction logic.
+func (e *entry) gcra(p Params, now int64, consume, shape bool) Decision {
+	win := float64(p.Window.Nanoseconds())
+	lim := float64(p.Limit)
+	unit := max(int64(math.Round(win/lim)), 1)                      // T
+	inc := max(int64(math.Round(win*float64(p.Cost)/lim)), 1)       // n*T
+	capNs := max(int64(math.Round(win*float64(p.Burst)/lim)), unit) // Burst*T
+	backlog := max(e.tat-now, 0)
+	wait := backlog // queue wait of this request (leaky bucket)
+	allowed := backlog+inc <= capNs
+	var retry time.Duration
+	if allowed {
+		if consume {
+			backlog += inc
+			e.tat = now + backlog
+		}
+	} else if inc > capNs {
+		retry = time.Duration(backlog) // can never fit: time to drain
+	} else {
+		retry = time.Duration(backlog + inc - capNs)
+	}
+	d := Decision{Allowed: allowed, Limit: p.Burst, RetryAfter: ceilMs(retry)}
+	if consume {
+		e.idleNs = max(e.tat-now, 0)
+	}
+	// After consuming, the backlog includes this request; for a peek it is
+	// the current backlog (the state a following request would see).
+	d.Remaining = int(max((capNs-backlog)/unit, 0))
+	d.ResetAfter = ceilMs(time.Duration(backlog))
+	if shape && allowed {
+		d.Delay = ceilMs(time.Duration(wait))
 	}
 	return d
 }

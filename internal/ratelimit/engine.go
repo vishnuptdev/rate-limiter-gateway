@@ -23,10 +23,14 @@ type Params struct {
 // Decision is the outcome of a check.
 type Decision struct {
 	Allowed    bool
-	Limit      int           // effective limit (token bucket: Burst)
+	Limit      int           // effective limit (token bucket, GCRA, leaky bucket: Burst)
 	Remaining  int           // units left after this call (never negative)
 	ResetAfter time.Duration // time until the bucket/window is fully replenished
 	RetryAfter time.Duration // when !Allowed: earliest time a retry could succeed
+	// Delay is how long the caller must hold an allowed request before
+	// proceeding. Only AlgoLeakyBucket sets it (its queue wait); every other
+	// algorithm leaves it zero.
+	Delay time.Duration
 }
 
 // Engine checks and consumes rate limits. Implementations must be safe for

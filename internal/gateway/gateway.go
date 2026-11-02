@@ -413,6 +413,21 @@ func (g *Gateway) serveProxy(w http.ResponseWriter, r *http.Request, cleaned str
 		}
 	}
 
+	// Leaky-bucket shaping: hold the admitted request until its queue slot
+	// comes up. A client that disconnects while queued is not proxied; its
+	// concurrency slots (if any) are released by the deferred releaseSlots.
+	if wait := out.shapingDelay(); wait > 0 {
+		timer := time.NewTimer(wait)
+		select {
+		case <-timer.C:
+		case <-r.Context().Done():
+			timer.Stop()
+			le.Decision, le.Error = model.DecisionError, "client_closed"
+			w.WriteHeader(499) // nginx convention: client closed request
+			return
+		}
+	}
+
 	st = &reqState{consumerID: le.ConsumerID, clientIP: ip, started: g.now()}
 	st.xff, st.proto, st.host = forwardedFor(cfg, r, xff)
 	if b := out.best; b != nil {

@@ -242,3 +242,50 @@ redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', now)
 redis.call('ZPOPMIN', KEYS[1], tonumber(ARGV[1]))
 return 1
 `
+
+// ARGV: limit, window_ms, burst, cost, peek, shape
+// Shared by GCRA (shape=0) and the leaky bucket (shape=1); see
+// Memory.gcra for the semantics. State: string key holding the theoretical
+// arrival time (TAT) in microseconds of server time. Working in microseconds
+// keeps the emission interval accurate for high limits. Returns the usual six
+// values plus delay_ms (leaky bucket queue wait).
+const luaGCRA = luaPrelude + `
+local limit = tonumber(ARGV[1])
+local window = tonumber(ARGV[2]) * 1000
+local burst = tonumber(ARGV[3])
+local cost = tonumber(ARGV[4])
+local peek = ARGV[5] == '1'
+local shape = ARGV[6] == '1'
+local nowus = tonumber(t[1]) * 1000000 + tonumber(t[2])
+local unit = math.max(math.floor(window / limit + 0.5), 1)
+local inc = math.max(math.floor(window * cost / limit + 0.5), 1)
+local cap = math.max(math.floor(window * burst / limit + 0.5), unit)
+local cur = redis.call('GET', KEYS[1])
+local existed = 0
+local tat = 0
+if cur then existed = 1; tat = tonumber(cur) end
+local backlog = math.max(tat - nowus, 0)
+local wait = backlog
+local allowed = 0
+local retry = 0
+if backlog + inc <= cap then
+  allowed = 1
+  if not peek then backlog = backlog + inc end
+elseif inc > cap then
+  retry = backlog
+else
+  retry = backlog + inc - cap
+end
+if not peek then
+  if allowed == 1 then
+    redis.call('SET', KEYS[1], string.format('%.0f', nowus + backlog), 'PX', math.ceil(backlog / 1000) + 1000)
+  elseif existed == 1 then
+    redis.call('PEXPIRE', KEYS[1], math.ceil(backlog / 1000) + 1000)
+  end
+end
+local rem = math.floor((cap - backlog) / unit)
+if rem < 0 then rem = 0 end
+local delay = 0
+if shape and allowed == 1 then delay = math.ceil(wait / 1000) end
+return {allowed, burst, rem, math.ceil(backlog / 1000), math.ceil(retry / 1000), existed, delay}
+`

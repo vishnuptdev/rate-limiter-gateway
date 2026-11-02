@@ -42,18 +42,21 @@ type checkResult struct {
 }
 
 type checkResponse struct {
-	Allowed     bool              `json:"allowed"`
-	Decision    string            `json:"decision"`
-	RouteID     string            `json:"route_id,omitempty"`
-	ConsumerID  string            `json:"consumer_id,omitempty"`
-	PolicyID    string            `json:"policy_id,omitempty"`
-	Limit       int               `json:"limit"`
-	Remaining   int               `json:"remaining"`
-	ResetS      int               `json:"reset_s"`
-	RetryAfterS int               `json:"retry_after_s,omitempty"`
-	Error       string            `json:"error,omitempty"`
-	Headers     map[string]string `json:"headers"`
-	Results     []checkResult     `json:"results"`
+	Allowed     bool   `json:"allowed"`
+	Decision    string `json:"decision"`
+	RouteID     string `json:"route_id,omitempty"`
+	ConsumerID  string `json:"consumer_id,omitempty"`
+	PolicyID    string `json:"policy_id,omitempty"`
+	Limit       int    `json:"limit"`
+	Remaining   int    `json:"remaining"`
+	ResetS      int    `json:"reset_s"`
+	RetryAfterS int    `json:"retry_after_s,omitempty"`
+	// DelayMs is how long the caller should hold the request before
+	// proceeding (leaky-bucket shaping). The check API never sleeps itself.
+	DelayMs int64             `json:"delay_ms"`
+	Error   string            `json:"error,omitempty"`
+	Headers map[string]string `json:"headers"`
+	Results []checkResult     `json:"results"`
 }
 
 const maxCheckBody = 64 << 10
@@ -216,9 +219,11 @@ func (g *Gateway) serveCheck(w http.ResponseWriter, r *http.Request) {
 		finish(http.StatusTooManyRequests)
 	case out.shadow:
 		resp.Allowed, resp.Decision = true, model.DecisionShadowLimited
+		resp.DelayMs = out.shapingDelay().Milliseconds()
 		finish(http.StatusOK)
 	default:
 		resp.Allowed, resp.Decision = true, model.DecisionAllowed
+		resp.DelayMs = out.shapingDelay().Milliseconds()
 		finish(http.StatusOK)
 	}
 }

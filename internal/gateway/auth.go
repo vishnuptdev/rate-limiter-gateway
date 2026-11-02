@@ -1,7 +1,6 @@
 package gateway
 
 import (
-	"context"
 	"net/http"
 	"net/url"
 	"strings"
@@ -166,7 +165,7 @@ func (g *Gateway) serveAuth(w http.ResponseWriter, r *http.Request, reserved str
 			return q.Get(n)
 		}}
 	ri.apiKey = cfg.extractKey(get)
-	cons, reason := cfg.authenticate(ri.apiKey, start)
+	cons, reason := ri.authenticate(cfg, start)
 	if reason != "" || (cons == nil && route.r.RequireAPIKey) {
 		if reason != "" {
 			le.Error = reason
@@ -192,7 +191,7 @@ func (g *Gateway) serveAuth(w http.ResponseWriter, r *http.Request, reserved str
 		slot = true
 	}
 
-	ectx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	ectx, cancel := g.engineCtx(r.Context())
 	out := g.evaluate(ectx, ri, evalOpts{skipConcurrency: true, costMul: 1})
 	cancel()
 	for _, s := range out.soft {

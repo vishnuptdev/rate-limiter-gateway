@@ -136,7 +136,11 @@ func NewMemory(opts MemoryOptions) *Memory {
 	return m
 }
 
-func (m *Memory) Name() string                      { return "memory" }
+func (m *Memory) Name() string { return "memory" }
+
+// InProcess reports that the engine never blocks on I/O, so callers need
+// not put a deadline on its calls (the context is not consulted).
+func (m *Memory) InProcess() bool                   { return true }
 func (m *Memory) Healthy(ctx context.Context) error { return nil }
 
 // Close stops the GC goroutine. It is safe to call more than once.

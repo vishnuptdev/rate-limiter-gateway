@@ -110,7 +110,7 @@ instance watches the config version and picks up changes.
 | `fixed_window` | One counter per calendar-aligned window | O(1) | You want the simplest option and accept up to 2x burst across a window boundary |
 | `concurrency` | Caps in-flight requests; the slot is released when the proxied response completes | O(in-flight) | You want to protect an upstream from simultaneous load (proxy mode only; the check API skips it) |
 | `gcra` | Generic Cell Rate Algorithm: one timestamp per key (the theoretical arrival time); admits at a smooth rate `limit/window` with `burst` tolerance | O(1), one int64 | You want token-bucket behaviour with the smallest possible state, or exact per-request `Retry-After` hints |
-| `leaky_bucket` | Traffic shaping: requests queue and drain at `limit/window`; `burst` is the queue size. Admitted requests are delayed (the gateway waits, up to the window) instead of rejected; a full queue gives 429 | O(1), one int64 | You must smooth bursts into an even rate for a fragile upstream and prefer latency over errors. The check API returns `delay_ms` rather than sleeping |
+| `leaky_bucket` | Traffic shaping: requests queue and drain at `limit/window`; `burst` is the queue size. Admitted requests are delayed (the gateway waits; max queue delay is validated to <= 30s) instead of rejected; a full queue gives 429 | O(1), one int64 | You must smooth bursts into an even rate for a fragile upstream and prefer latency over errors. The check API returns `delay_ms` rather than sleeping |
 
 Token bucket and sliding window are the two you will reach for most often.
 Token bucket gives burst tolerance: up to `burst` requests go through at once,

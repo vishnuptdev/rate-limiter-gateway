@@ -219,11 +219,16 @@ func (g *Gateway) serveCheck(w http.ResponseWriter, r *http.Request) {
 		finish(http.StatusTooManyRequests)
 	case out.shadow:
 		resp.Allowed, resp.Decision = true, model.DecisionShadowLimited
-		resp.DelayMs = out.shapingDelay().Milliseconds()
+		resp.DelayMs = shapeMs(out)
 		finish(http.StatusOK)
 	default:
 		resp.Allowed, resp.Decision = true, model.DecisionAllowed
-		resp.DelayMs = out.shapingDelay().Milliseconds()
+		resp.DelayMs = shapeMs(out)
 		finish(http.StatusOK)
 	}
+}
+
+func shapeMs(o *outcome) int64 {
+	d, _ := o.shapingDelay()
+	return d.Milliseconds()
 }

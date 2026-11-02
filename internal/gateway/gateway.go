@@ -42,7 +42,13 @@ type Options struct {
 	Recorder Recorder         // optional
 	Tokens   TokenVerifier    // optional; nil => check API rejects every caller
 	Logger   *slog.Logger     // optional
+	// MaxShapingWaiters caps how many requests may wait in leaky-bucket
+	// queues at once, across all keys; default 10000. Beyond it requests get
+	// 429 instead of parking another goroutine.
+	MaxShapingWaiters int
 }
+
+const defaultMaxShapingWaiters = 10000
 
 type Gateway struct {
 	engine   ratelimit.Engine
@@ -50,6 +56,9 @@ type Gateway struct {
 	tokens   TokenVerifier
 	log      *slog.Logger
 	now      func() time.Time // overridable in tests
+
+	shapeWaiters    atomic.Int64
+	maxShapeWaiters int64
 
 	cfg atomic.Pointer[compiled]
 
@@ -65,6 +74,10 @@ func New(o Options) *Gateway {
 	g := &Gateway{
 		engine: o.Engine, recorder: o.Recorder, tokens: o.Tokens, log: o.Logger,
 		now: time.Now, proxies: map[string]*httputil.ReverseProxy{},
+	}
+	g.maxShapeWaiters = int64(o.MaxShapingWaiters)
+	if g.maxShapeWaiters <= 0 {
+		g.maxShapeWaiters = defaultMaxShapingWaiters
 	}
 	if g.engine == nil {
 		g.engine = noEngine{}
@@ -416,12 +429,29 @@ func (g *Gateway) serveProxy(w http.ResponseWriter, r *http.Request, cleaned str
 	// Leaky-bucket shaping: hold the admitted request until its queue slot
 	// comes up. A client that disconnects while queued is not proxied; its
 	// concurrency slots (if any) are released by the deferred releaseSlots.
-	if wait := out.shapingDelay(); wait > 0 {
+	if wait, tooLong := out.shapingDelay(); wait > 0 {
+		reject := ""
+		if tooLong {
+			reject = "shaping_delay_too_long"
+		} else if g.shapeWaiters.Add(1) > g.maxShapeWaiters {
+			g.shapeWaiters.Add(-1)
+			reject = "shaping_queue_full"
+		}
+		if reject != "" {
+			le.Decision, le.Error = model.DecisionLimited, reject
+			w.Header().Set("Retry-After", "1")
+			writeJSON(w, http.StatusTooManyRequests, map[string]any{
+				"error": "rate_limited", "message": "Request queue is full", "retry_after_s": 1,
+			})
+			return
+		}
 		timer := time.NewTimer(wait)
 		select {
 		case <-timer.C:
+			g.shapeWaiters.Add(-1)
 		case <-r.Context().Done():
 			timer.Stop()
+			g.shapeWaiters.Add(-1)
 			le.Decision, le.Error = model.DecisionError, "client_closed"
 			w.WriteHeader(499) // nginx convention: client closed request
 			return

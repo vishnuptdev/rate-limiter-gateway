@@ -332,24 +332,27 @@ func (c *compiled) clientIP(remoteAddr string, xff []string) string {
 	return cand
 }
 
+// maxShapingDelay is a defensive hard ceiling on a queue wait. store.Validate
+// already bounds a leaky bucket's delay to 30s; a decision above the ceiling
+// is denied (tooLong) rather than released early, which would break the
+// shaping rate.
+const maxShapingDelay = 30 * time.Second
+
 // shapingDelay is how long an admitted request must wait before proceeding:
-// the largest leaky-bucket queue delay among the enforcing policies, each
-// capped at its policy window (a sanity bound; a queue never legitimately
-// waits longer). Shadow policies never delay traffic.
-func (o *outcome) shapingDelay() time.Duration {
-	var max time.Duration
+// the largest leaky-bucket queue delay among the enforcing policies (shadow
+// policies never delay traffic). tooLong reports a delay above the ceiling.
+func (o *outcome) shapingDelay() (d time.Duration, tooLong bool) {
 	for i := range o.results {
 		r := &o.results[i]
 		if !r.called || r.denied || r.cp.mode == model.ModeShadow || r.dec.Delay <= 0 {
 			continue
 		}
-		d := r.dec.Delay
-		if w := r.params.Window; w > 0 && d > w {
-			d = w
+		if r.dec.Delay > maxShapingDelay {
+			return r.dec.Delay, true
 		}
-		if d > max {
-			max = d
+		if r.dec.Delay > d {
+			d = r.dec.Delay
 		}
 	}
-	return max
+	return d, false
 }

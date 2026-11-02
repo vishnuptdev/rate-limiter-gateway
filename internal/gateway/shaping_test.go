@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -86,7 +87,7 @@ func TestLeakyBucketGatewayDelaysThenRejects(t *testing.T) {
 
 func TestLeakyBucketClientAbortWhileQueued(t *testing.T) {
 	conc := pol("conc", model.AlgoConcurrency, 5, "global")
-	e := newShapeEnv(t, conc, leaky("lb", 1, 10*time.Second, 3)) // 10s per slot
+	e := newShapeEnv(t, conc, leaky("lb", 1, 10*time.Second, 4)) // 10s per slot
 	if rr := e.get(context.Background()); rr.Code != 200 {
 		t.Fatalf("first: %d", rr.Code)
 	}
@@ -115,16 +116,52 @@ func TestLeakyBucketClientAbortWhileQueued(t *testing.T) {
 	}
 }
 
-func TestLeakyBucketWaitCappedAtWindow(t *testing.T) {
-	o := &outcome{results: []polResult{{
-		cp: &cpolicy{mode: model.ModeEnforce}, called: true,
-		params: ratelimit.Params{Window: time.Second}, dec: ratelimit.Decision{Allowed: true, Delay: time.Minute},
-	}, {
-		cp: &cpolicy{mode: model.ModeShadow}, called: true,
-		params: ratelimit.Params{Window: time.Hour}, dec: ratelimit.Decision{Allowed: true, Delay: time.Hour},
-	}}}
-	if d := o.shapingDelay(); d != time.Second {
-		t.Fatalf("delay %v want 1s (capped, shadow ignored)", d)
+func TestShapingDelayNeverReleasesEarly(t *testing.T) {
+	mk := func(delay time.Duration) *outcome {
+		return &outcome{results: []polResult{{
+			cp: &cpolicy{mode: model.ModeEnforce}, called: true,
+			params: ratelimit.Params{Window: time.Second}, dec: ratelimit.Decision{Allowed: true, Delay: delay},
+		}, {
+			cp: &cpolicy{mode: model.ModeShadow}, called: true,
+			params: ratelimit.Params{Window: time.Hour}, dec: ratelimit.Decision{Allowed: true, Delay: time.Hour},
+		}}}
+	}
+	// Delay beyond the policy window is honoured (burst > limit), shadow ignored.
+	if d, tooLong := mk(5 * time.Second).shapingDelay(); d != 5*time.Second || tooLong {
+		t.Fatalf("delay %v tooLong=%v", d, tooLong)
+	}
+	if _, tooLong := mk(31 * time.Second).shapingDelay(); !tooLong {
+		t.Fatal("delay above the hard ceiling must be denied, not clamped")
+	}
+}
+
+func TestShapingQueueFullAndDeniedBeyondCeiling(t *testing.T) {
+	e := newShapeEnv(t, leaky("lb", 1, 10*time.Second, 4)) // 10s per slot
+	e.g.maxShapeWaiters = 2
+	if rr := e.get(context.Background()); rr.Code != 200 { // first: no delay
+		t.Fatalf("first: %d", rr.Code)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() { defer wg.Done(); e.get(ctx) }()
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for e.g.shapeWaiters.Load() != 2 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	rr := e.get(context.Background())
+	if rr.Code != 429 || rr.Header().Get("Retry-After") != "1" {
+		t.Fatalf("waiter cap: %d %v", rr.Code, rr.Header())
+	}
+	if le := e.rec.last(t); le.Error != "shaping_queue_full" {
+		t.Fatalf("log: %+v", le)
+	}
+	cancel()
+	wg.Wait()
+	if n := e.g.shapeWaiters.Load(); n != 0 {
+		t.Fatalf("waiter counter leaked: %d", n)
 	}
 }
 

@@ -62,8 +62,8 @@ hop, and (c) an embedded admin dashboard.
   Shadow denies are recorded and continue.
 - Concurrency policies: release slot when the proxied response completes.
 - Leaky-bucket policies: an allowed decision carries `Decision.Delay`; the proxy
-  waits that long (timer + `select` on the client context, capped at the policy
-  window) before forwarding. A client abort while queued logs decision `error` /
+  waits that long (timer + `select` on the client context, bounded by validation (30s max);
+  a global waiter cap (default 10000) returns 429 `shaping_queue_full`) before forwarding. A client abort while queued logs decision `error` /
   `client_closed` (HTTP 499) and does not proxy; held concurrency slots are still
   released. GCRA and leaky bucket share one state value (TAT) and one Lua script.
 - Backend error: policy `FailMode` open → skip policy; closed → `503 {"error":"limiter_unavailable"}`.
